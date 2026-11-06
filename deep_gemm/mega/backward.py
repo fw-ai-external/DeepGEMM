@@ -1,4 +1,3 @@
-import os
 import time
 from typing import Any, Callable, NamedTuple, Optional, Tuple
 
@@ -47,8 +46,6 @@ _BF16_BACKWARD_KERNEL_TRACE_FIELDS = (
     "sm_id",
 )
 _BF16_BACKWARD_DECOMPOSE_PRELUDE = False
-_BF16_BACKWARD_SPLIT_BARRIER_FUSED_ROUTE = os.getenv("DG_BF16_SPLIT_BARRIER_FUSED_ROUTE", "1") == "1"
-_BF16_ROUTE_PRELUDE_THREADS = os.getenv("DG_BF16_ROUTE_PRELUDE_THREADS", "128")
 
 
 def _timed_cuda_phase(name: str, operation: Callable[[], Any]) -> Any:
@@ -259,6 +256,9 @@ def bf16_mega_moe_backward_dgrad(
     situ_beta: float = 4.0,
     situ_linear_beta: Optional[float] = None,
     w3_weights: Optional[torch.Tensor] = None,
+    *,
+    split_barrier_fused_route: bool = True,
+    route_prelude_threads: int = 128,
 ) -> None:
     """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x.
 
@@ -274,7 +274,13 @@ def bf16_mega_moe_backward_dgrad(
     For SiTU, ``fast_math=True`` uses the hardware tanh approximation in
     backward only. Sigmoid evaluation, FP32 arithmetic order and BF16
     materialization are unchanged. The default retains precise tanh.
+
+    Route-prelude scheduling is configured per call. The defaults preserve
+    the split-barrier fused route prelude and the 128-thread H2048 route dot.
+    Other hidden widths retain their 256-thread prelude.
     """
+    if route_prelude_threads not in (128, 256):
+        raise ValueError(f"route_prelude_threads must be 128 or 256, got {route_prelude_threads!r}")
     situ_kwargs = _situ_kwargs(activation, situ_beta, situ_linear_beta,
                                route_weight_mode, activation_limit, fast_math,
                                allow_fast_math=bool(getattr(
@@ -391,24 +397,13 @@ def bf16_mega_moe_backward_dgrad(
             synchronize_after_dispatch: bool,
             barrier_only: bool = False,
         ) -> None:
-            route_prelude_threads = 256
+            threads = 256
             if (
                 compute_route_dot
                 and grad_y.shape[1] == 2048
                 and combine_order_mode is not CombineOrderMode.FIXED_TOPK
             ):
-                try:
-                    route_prelude_threads = int(_BF16_ROUTE_PRELUDE_THREADS)
-                except ValueError as exc:
-                    raise ValueError(
-                        "DG_BF16_ROUTE_PRELUDE_THREADS must be 128 or 256, got "
-                        f"{_BF16_ROUTE_PRELUDE_THREADS!r}"
-                    ) from exc
-                if route_prelude_threads not in (128, 256):
-                    raise ValueError(
-                        "DG_BF16_ROUTE_PRELUDE_THREADS must be 128 or 256, got "
-                        f"{route_prelude_threads}"
-                    )
+                threads = route_prelude_threads
             _C.bf16_mega_moe_backward_post_down_prelude_v2(
                 grad_y_unweighted_output,
                 grad_ye,
@@ -434,7 +429,7 @@ def bf16_mega_moe_backward_dgrad(
                 synchronize_after_dispatch,
                 barrier_only,
                 x_prepared,
-                route_prelude_threads,
+                threads,
             )
 
         def launch_decomposed_route_prelude() -> None:
@@ -596,7 +591,7 @@ def bf16_mega_moe_backward_dgrad(
                 if prepare_route_and_weighted and _BF16_BACKWARD_DECOMPOSE_PRELUDE
                 else (
                     launch_split_barrier_fused_route_prelude
-                    if (prepare_route_and_weighted and _BF16_BACKWARD_SPLIT_BARRIER_FUSED_ROUTE)
+                    if (prepare_route_and_weighted and split_barrier_fused_route)
                     else (
                         launch_chunked_route_prelude
                         if prepare_route_and_weighted

@@ -1,0 +1,117 @@
+"""CPU contracts for explicit backward scheduling and collective order."""
+
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from deep_gemm.mega import CombineOrderMode, RouteWeightMode
+
+BACKWARD = Path(__file__).resolve().parents[1] / "deep_gemm/mega/backward.py"
+
+
+def load(path, suffix):
+    spec = importlib.util.spec_from_file_location("deep_gemm.mega." + suffix, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def invoke(module, hidden, calls=None, **options):
+    calls = [] if calls is None else calls
+    module._C = SimpleNamespace(
+        bf16_mega_moe_backward_post_down_prelude_v2=lambda *args: calls.append(("prelude", args[17:])),
+        bf16_mega_moe_backward_dgrad_v2=lambda *args, **kwargs: calls.append(("dgrad", ())),
+    )
+    # Real CPU tensors retain the wrapper's alias/lifetime checks. Only the
+    # native GPU launches are intercepted; no numerical result is claimed.
+    gate = torch.empty(2, 8, dtype=torch.bfloat16)
+    weighted = torch.empty(2, hidden, dtype=torch.bfloat16)
+    unweighted = torch.empty_like(weighted)
+    grad_h = unweighted.flatten()[:8].view(2, 4)
+    buffer = SimpleNamespace(
+        group=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+        backward_grad_y=torch.empty_like(weighted),
+        backward_grad_route=torch.empty(2, 1),
+        x=object(),
+        topk_weights=object(),
+        token_src_metadata=object(),
+        handle=SimpleNamespace(buffer_ptrs=[1]),
+        num_topk=1,
+        num_max_tokens_per_rank=2,
+        hidden=hidden,
+    )
+    module.bf16_mega_moe_backward_dgrad(
+        gate,
+        grad_h,
+        gate,
+        grad_h,
+        grad_h,
+        torch.empty_like(weighted),
+        torch.empty_like(weighted),
+        torch.empty(2),
+        weighted,
+        torch.empty(2),
+        torch.empty(1),
+        torch.empty(1),
+        torch.empty(1, dtype=torch.int32),
+        torch.empty(1, dtype=torch.int32),
+        torch.ones_like(weighted),
+        buffer,
+        float("inf"),
+        128,
+        direct_remote_grad_x=False,
+        route_weight_mode=RouteWeightMode.POST_DOWN,
+        grad_y_unweighted_output=unweighted,
+        down_unweighted_output=weighted,
+        combine_order_mode=CombineOrderMode.DEEPEP,
+        memory_mode="phase_ordered",
+        **options,
+    )
+    return calls
+
+
+def expected_calls(hidden, fused=True, threads=128):
+    route_threads = threads if hidden == 2048 else 256
+    if fused:
+        schedule = [
+            (False, False, False, True, False, True, False, 256),
+            (True, True, True, False, False, False, False, route_threads),
+            (False, False, False, False, True, True, False, 256),
+        ]
+    else:
+        schedule = [
+            (True, False, False, True, True, False, False, 256),
+            (False, True, True, False, False, False, False, route_threads),
+        ]
+    return [("prelude", arguments) for arguments in schedule] + [("dgrad", ())]
+
+
+@pytest.mark.parametrize("hidden", [2048, 3584])
+def test_defaults_ignore_legacy_environment(monkeypatch, hidden):
+    monkeypatch.setenv("DG_BF16_SPLIT_BARRIER_FUSED_ROUTE", "0")
+    monkeypatch.setenv("DG_BF16_ROUTE_PRELUDE_THREADS", "invalid")
+    module = load(BACKWARD, "candidate_defaults")
+    assert invoke(module, hidden) == expected_calls(hidden)
+
+
+@pytest.mark.parametrize("hidden", [2048, 3584])
+@pytest.mark.parametrize("threads", [128, 256])
+@pytest.mark.parametrize("fused", [True, False])
+def test_explicit_controls_preserve_collective_order(monkeypatch, hidden, threads, fused):
+    monkeypatch.setenv("DG_BF16_SPLIT_BARRIER_FUSED_ROUTE", "0" if fused else "1")
+    monkeypatch.setenv("DG_BF16_ROUTE_PRELUDE_THREADS", "256" if threads == 128 else "128")
+    module = load(BACKWARD, "candidate_explicit")
+    assert invoke(module, hidden, route_prelude_threads=threads, split_barrier_fused_route=fused) == expected_calls(
+        hidden, fused, threads
+    )
+
+
+@pytest.mark.parametrize("invalid", [0, 64, 192, "128"])
+def test_invalid_threads_fail_before_native_launch(invalid):
+    module = load(BACKWARD, "candidate_invalid")
+    calls = []
+    with pytest.raises(ValueError, match="route_prelude_threads must be 128 or 256"):
+        invoke(module, 2048, calls=calls, route_prelude_threads=invalid)
+    assert not calls
