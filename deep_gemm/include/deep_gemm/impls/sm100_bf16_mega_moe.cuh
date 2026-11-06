@@ -435,20 +435,24 @@ sm100_bf16_mega_moe_impl(void* y,
                             kDispatchBarrierIdx);
                     });
 
-                if (
-                    global_warp_idx < kNumExperts &&
-                    lane_idx == 0) {
-                    uint32_t prefix = 0;
-                    for (uint32_t source_warp = 0;
-                         source_warp < kNumGlobalWarps;
-                         ++source_warp) {
-                        auto count_ptr =
-                            warp_expert_prefix +
-                            source_warp * kNumExperts +
-                            global_warp_idx;
-                        const uint32_t count = *count_ptr;
-                        *count_ptr = prefix;
-                        prefix += count;
+                if (lane_idx == 0) {
+                    // Experts can outnumber dispatch warps (e.g. 896 experts
+                    // on 148 SMs). Convert every histogram column to prefixes.
+                    for (uint32_t target_expert = global_warp_idx;
+                         target_expert < kNumExperts;
+                         target_expert += kNumGlobalWarps) {
+                        uint32_t prefix = 0;
+                        for (uint32_t source_warp = 0;
+                             source_warp < kNumGlobalWarps;
+                             ++source_warp) {
+                            auto count_ptr =
+                                warp_expert_prefix +
+                                source_warp * kNumExperts +
+                                target_expert;
+                            const uint32_t count = *count_ptr;
+                            *count_ptr = prefix;
+                            prefix += count;
+                        }
                     }
                 }
 
