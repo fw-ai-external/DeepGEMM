@@ -74,9 +74,10 @@ def single_rank_group(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dist
 
 @pytest.mark.parametrize("route_mode", ["pre_down", "post_down"])
 @pytest.mark.parametrize("activation,limit", [("swiglu", math.inf), ("swiglu", 10.0), ("geglu", 10.0)])
+@pytest.mark.parametrize("fast_math", [False, True])
 @torch.no_grad()
 def test_fp32_is_optional_and_default_bf16_stays_graph_safe(
-    single_rank_group: dist.ProcessGroup, route_mode: str, activation: str, limit: float
+    single_rank_group: dist.ProcessGroup, route_mode: str, activation: str, limit: float, fast_math: bool
 ) -> None:
     tokens, hidden, intermediate, experts, topk = 128, 1024, 256, 8, 2
     torch.manual_seed(41)
@@ -103,7 +104,7 @@ def test_fp32_is_optional_and_default_bf16_stays_graph_safe(
             activation=activation,
             activation_clamp=limit,
             route_weight_mode=deep_gemm.RouteWeightMode(route_mode),
-            fast_math=False,
+            fast_math=fast_math,
         )
 
     forward(bf16)
