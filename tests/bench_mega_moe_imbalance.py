@@ -352,6 +352,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     # 临时文件和库缓存计入同一个作业输出目录，保留失败证据。
     for name, directory in (("TMPDIR", "tmp"), ("XDG_CACHE_HOME", "cache"),
+                            ("CUDA_CACHE_PATH", "cuda-cache"),
                             ("DG_JIT_CACHE_DIR", "deep-gemm-cache"),
                             ("TRITON_CACHE_DIR", "triton-cache")):
         path = args.output / directory
