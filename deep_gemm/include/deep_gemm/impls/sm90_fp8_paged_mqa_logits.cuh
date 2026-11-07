@@ -11,6 +11,7 @@
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/epilogue/sm90_mqa_logits_reduce.cuh>
 #include <deep_gemm/mma/sm90.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
@@ -221,6 +222,9 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
         const auto sub_warp_offset = (warp_idx % 4) * 16;
         const auto v_0_offset = lane_idx / 4 + 0;
         const auto v_1_offset = lane_idx / 4 + 8;
+        using QuadReduce = epilogue::QuadReduce<kNextN>;
+        const auto owned_row = QuadReduce::owned_row(lane_idx);
+        cute::GmmaDescriptor desc_q;
 
         // Initialize `q_idx` outside `[0, batch_size)` to indicate it was none
         uint32_t q_idx = batch_size, kv_idx;
@@ -245,6 +249,10 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
                     for (uint32_t j = 0; j < kNumHeads / 4; ++ j)
                         weights[i][j] = ptx::ld_shared(smem_weights[q_stage_idx] + i * kNumHeads + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2);
                 }
+
+                // The K slice `k` starts `k * WGMMA::K` FP8 bytes into a `kHeadDim`-byte swizzled row: the
+                // descriptor's start address (in 16-byte units) advances by `WGMMA::K / 16`
+                desc_q = mma::sm90::make_smem_desc(smem_q[q_stage_idx], mma::sm90::to_swizzle_cute_type<kHeadDim>(), 0, kHeadDim * 8);
             }
 
             // Get current Q and KV index
@@ -266,14 +274,12 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
             for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
                 ptx::warpgroup_fence_operand(accum[i]);
             ptx::warpgroup_arrive();
+            const auto desc_kv = mma::sm90::make_smem_desc(smem_kv[kv_stage_idx], mma::sm90::to_swizzle_cute_type<kHeadDim>(), 0, kHeadDim * 8);
             #pragma unroll
             for (uint32_t k = 0; k < kHeadDim / WGMMA::K; ++ k) {
-                auto desc_a = mma::sm90::make_smem_desc(
-                    smem_kv[kv_stage_idx] + k * WGMMA::K,
-                    mma::sm90::to_swizzle_cute_type<kHeadDim>(), 0, kHeadDim * 8);
-                auto desc_b = mma::sm90::make_smem_desc(
-                    smem_q[q_stage_idx] + k * WGMMA::K,
-                    mma::sm90::to_swizzle_cute_type<kHeadDim>(), 0, kHeadDim * 8);
+                auto desc_a = desc_kv, desc_b = desc_q;
+                desc_a.reg32_[0] += k * WGMMA::K / 16;
+                desc_b.reg32_[0] += k * WGMMA::K / 16;
                 WGMMA::wgmma(desc_a, desc_b, accum, k);
             }
             ptx::warpgroup_commit_batch();
@@ -296,6 +302,7 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
             DG_STATIC_ASSERT(WGMMA::kNumAccum % kNumAccumPerReduce == 0, "Invalid accumulation");
             DG_STATIC_ASSERT(WGMMA::kNumAccum / kNumAccumPerReduce == kNextN, "Invalid accumulation");
             DG_STATIC_ASSERT(kNumHeads % 8 == 0, "Invalid head");
+            float v[kNextN][2];
             #pragma unroll
             for (uint32_t i = 0; i < kNextN; ++ i) {
                 auto shifted_accum = accum + i * kNumAccumPerReduce;
@@ -311,21 +318,19 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
                     for (uint32_t k = 0; k < 4; k ++)
                         sum[k] += transform(j * 4 + k);
                 }
-                float v_0 = (sum[0] + sum[1]) * scale_kv_0;
-                float v_1 = (sum[2] + sum[3]) * scale_kv_1;
+                v[i][0] = (sum[0] + sum[1]) * scale_kv_0;
+                v[i][1] = (sum[2] + sum[3]) * scale_kv_1;
+            }
 
-                // Inter-thread reduction
-                #pragma unroll
-                for (uint32_t j = 0; j < 2; ++ j) {
-                    const auto offset = static_cast<int>(1u << j);
-                    v_0 += __shfl_xor_sync(0xffffffffu, v_0, offset);
-                    v_1 += __shfl_xor_sync(0xffffffffu, v_1, offset);
-                }
+            // Inter-thread reduction
+            QuadReduce::reduce(v, lane_idx);
 
-                // Store into the global memory
-                // NOTES: we have redundant writes here, consider more carefully
-                logits[kv_offset + i * static_cast<uint64_t>(logits_stride) + v_0_offset] = static_cast<logits_dtype_t>(v_0);
-                logits[kv_offset + i * static_cast<uint64_t>(logits_stride) + v_1_offset] = static_cast<logits_dtype_t>(v_1);
+            // Store into the global memory
+            #pragma unroll
+            for (uint32_t r = 0; r < QuadReduce::kNumOwnedRows; ++ r) {
+                const auto row_offset = kv_offset + (owned_row + r) * static_cast<uint64_t>(logits_stride);
+                logits[row_offset + v_0_offset] = static_cast<logits_dtype_t>(v[r][0]);
+                logits[row_offset + v_1_offset] = static_cast<logits_dtype_t>(v[r][1]);
             }
         }
     }
