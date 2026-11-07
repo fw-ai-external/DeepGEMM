@@ -2,7 +2,8 @@
 
 import importlib.util
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -11,18 +12,23 @@ from deep_gemm.mega import CombineOrderMode, RouteWeightMode
 BACKWARD = Path(__file__).resolve().parents[1] / "deep_gemm/mega/backward.py"
 
 
-def load(path, suffix):
+def load(path: Path, suffix: str) -> ModuleType:
     spec = importlib.util.spec_from_file_location("deep_gemm.mega." + suffix, path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def invoke(module, hidden, calls=None, **options):
+def invoke(
+    module: ModuleType, hidden: int, calls: list[tuple[str, tuple]] | None = None, **options: Any
+) -> list[tuple[str, tuple]]:
     calls = [] if calls is None else calls
     module._C = SimpleNamespace(
         bf16_mega_moe_backward_post_down_prelude_v2=lambda *args: calls.append(("prelude", args[17:])),
-        bf16_mega_moe_backward_dgrad_v2=lambda *args, **kwargs: calls.append(("dgrad", ())),
+        bf16_mega_moe_backward_dgrad_v2=lambda *args, **kwargs: calls.append(
+            ("dgrad", (kwargs["vectorized_grad_x_store"], kwargs["wide_grad_x_store"]))
+        ),
     )
     # Real CPU tensors retain the wrapper's alias/lifetime checks. Only the
     # native GPU launches are intercepted; no numerical result is claimed.
@@ -72,7 +78,9 @@ def invoke(module, hidden, calls=None, **options):
     return calls
 
 
-def expected_calls(hidden, fused=True, threads=128):
+def expected_calls(
+    hidden: int, fused: bool = True, threads: int = 128, vectorized: bool = True, wide: bool = False
+) -> list[tuple[str, tuple]]:
     route_threads = threads if hidden == 2048 else 256
     if fused:
         schedule = [
@@ -85,13 +93,15 @@ def expected_calls(hidden, fused=True, threads=128):
             (True, False, False, True, True, False, False, 256),
             (False, True, True, False, False, False, False, route_threads),
         ]
-    return [("prelude", arguments) for arguments in schedule] + [("dgrad", ())]
+    return [("prelude", arguments) for arguments in schedule] + [("dgrad", (vectorized, wide))]
 
 
 @pytest.mark.parametrize("hidden", [2048, 3584])
-def test_defaults_ignore_legacy_environment(monkeypatch, hidden):
+def test_defaults_ignore_legacy_environment(monkeypatch: pytest.MonkeyPatch, hidden: int) -> None:
     monkeypatch.setenv("DG_BF16_SPLIT_BARRIER_FUSED_ROUTE", "0")
     monkeypatch.setenv("DG_BF16_ROUTE_PRELUDE_THREADS", "invalid")
+    monkeypatch.setenv("DG_BF16_MEGA_MOE_VECTORIZED_GRAD_X_STORE", "0")
+    monkeypatch.setenv("DG_BF16_MEGA_MOE_WIDE_GRAD_X_STORE", "1")
     module = load(BACKWARD, "candidate_defaults")
     assert invoke(module, hidden) == expected_calls(hidden)
 
@@ -99,7 +109,9 @@ def test_defaults_ignore_legacy_environment(monkeypatch, hidden):
 @pytest.mark.parametrize("hidden", [2048, 3584])
 @pytest.mark.parametrize("threads", [128, 256])
 @pytest.mark.parametrize("fused", [True, False])
-def test_explicit_controls_preserve_collective_order(monkeypatch, hidden, threads, fused):
+def test_explicit_controls_preserve_collective_order(
+    monkeypatch: pytest.MonkeyPatch, hidden: int, threads: int, fused: bool
+) -> None:
     monkeypatch.setenv("DG_BF16_SPLIT_BARRIER_FUSED_ROUTE", "0" if fused else "1")
     monkeypatch.setenv("DG_BF16_ROUTE_PRELUDE_THREADS", "256" if threads == 128 else "128")
     module = load(BACKWARD, "candidate_explicit")
@@ -109,9 +121,22 @@ def test_explicit_controls_preserve_collective_order(monkeypatch, hidden, thread
 
 
 @pytest.mark.parametrize("invalid", [0, 64, 192, "128"])
-def test_invalid_threads_fail_before_native_launch(invalid):
+def test_invalid_threads_fail_before_native_launch(invalid: object) -> None:
     module = load(BACKWARD, "candidate_invalid")
     calls = []
     with pytest.raises(ValueError, match="route_prelude_threads must be 128 or 256"):
         invoke(module, 2048, calls=calls, route_prelude_threads=invalid)
     assert not calls
+
+
+@pytest.mark.parametrize("hidden", [2048, 3584])
+def test_store_options_can_change_between_calls_without_environment_state(
+    monkeypatch: pytest.MonkeyPatch, hidden: int
+) -> None:
+    module = load(BACKWARD, "candidate_store_options")
+    for vectorized, wide in ((False, False), (True, True), (False, True), (True, False)):
+        monkeypatch.setenv("DG_BF16_MEGA_MOE_VECTORIZED_GRAD_X_STORE", "0" if vectorized else "1")
+        monkeypatch.setenv("DG_BF16_MEGA_MOE_WIDE_GRAD_X_STORE", "0" if wide else "1")
+        assert invoke(module, hidden, vectorized_grad_x_store=vectorized, wide_grad_x_store=wide) == expected_calls(
+            hidden, vectorized=vectorized, wide=wide
+        )
