@@ -317,11 +317,14 @@ def test_paged_mqa_logits():
                         for block_kv in ((128, 32, 64, ) if arch_major == 10 else (64, )):
                             for use_2d_context_lens, clean_logits in [(True, False)]:
                                 for batch_size in (256, 4096):
-                                    for next_n in ((1, ) if is_varlen else ((1, 6) if arch_major == 10 else (1, 2))):
+                                    for next_n in ((1, ) if is_varlen else ((1, 6) if arch_major == 10 else (1, 2, 4))):
                                         for max_tokens_per_batch in ((6, 10) if is_varlen else (1, )):
                                             heads = (8, 12, 16, 20, 32, 64) if arch_major == 10 else (32, 64)
                                             head_dims = (64, 128) if is_mxfp4 else ((32, 64, 128) if arch_major == 10 else (128, ))
                                             for num_heads in heads:
+                                                # SM90 scores a query's rows in one WGMMA of N = next_n * num_heads <= 128
+                                                if arch_major == 9 and next_n * num_heads > 128:
+                                                    continue
                                                 for head_dim in head_dims:
                                                     for avg_kv in (8192, 65536):
                                                         if batch_size * avg_kv > max_kv_pool_tokens:

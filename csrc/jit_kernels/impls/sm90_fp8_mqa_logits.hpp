@@ -169,9 +169,10 @@ static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
     DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
     DG_HOST_ASSERT(split_kv % mma_m == 0 and logits_stride % split_kv == 0);
 
-    const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
+    // All `next_n` rows of a query go into one WGMMA of N = `next_n * num_heads`, reduced by `epilogue::QuadReduce`
+    DG_HOST_ASSERT((next_n == 1 or next_n == 2 or next_n == 4) and next_n * num_heads <= 128);
     const auto tensor_map_q = make_tma_2d_desc(q, head_dim, batch_size * next_n * num_heads,
-                                               head_dim, next_n_atom * num_heads,
+                                               head_dim, next_n * num_heads,
                                                static_cast<int>(q.stride(2)),
                                                head_dim);
     const auto tensor_map_kv = make_tma_3d_desc(kv_cache, head_dim, block_kv, num_kv_blocks,
@@ -183,7 +184,7 @@ static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
                                                        block_kv, 1,
                                                        static_cast<int>(kv_cache_scales.stride(0)), 0);
     const auto tensor_map_weights = make_tma_2d_desc(weights, num_heads, batch_size * next_n,
-                                                     num_heads, next_n_atom,
+                                                     num_heads, next_n,
                                                      static_cast<int>(weights.stride(0)), 0);
 
     const int swizzle_alignment = head_dim * 8;
@@ -197,7 +198,6 @@ static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
     const int smem_tmem_ptr = 4;
     const int smem_size = smem_q_pipe_size + num_math_warp_groups * smem_kv_pipe_size + smem_umma_barriers + smem_tmem_ptr;
     DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
-    DG_HOST_ASSERT(next_n == 1 or next_n == 2);
 
     DG_HOST_ASSERT(128 % num_heads == 0);
 

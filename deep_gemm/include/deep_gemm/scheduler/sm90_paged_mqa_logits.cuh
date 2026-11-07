@@ -94,8 +94,8 @@ void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
             schedule_metadata[sm_idx * 2 + 1] = kv_split_idx;
         }
     } else {
-        const uint32_t next_n_atom = (next_n >= 2) ? 2 : 1;
-        const uint32_t num_next_n_atoms = math::ceil_div(next_n, next_n_atom);
+        // The SM90 kernel scores all `next_n` rows of a query in one WGMMA, so a query is one atom
+        const uint32_t num_next_n_atoms = 1;
         const uint32_t total = sum * num_next_n_atoms;
         const uint32_t q = total / kNumSMs, r = total % kNumSMs;
         const uint32_t pivot = kNumSMs - r;
