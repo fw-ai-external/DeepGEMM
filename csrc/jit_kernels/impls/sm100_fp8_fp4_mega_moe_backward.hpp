@@ -1269,7 +1269,9 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         std::nullopt,
     const float situ_beta = 4.0f,
     const float situ_linear_beta = std::numeric_limits<float>::infinity(),
-    const std::optional<torch::Tensor>& w3_weights = std::nullopt) {
+    const std::optional<torch::Tensor>& w3_weights = std::nullopt,
+    const bool vectorized_grad_x_store = true,
+    const bool wide_grad_x_store = false) {
     constexpr int block_n = 128;
     constexpr int block_k = 128;
     constexpr int dgrad_block_k = 64;
@@ -1768,12 +1770,8 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .clear_wgrad_padding = clear_wgrad_padding,
         .compute_route_grad = true,
         .trace_kernel = kernel_trace.has_value(),
-        .vectorized_grad_x_store = deep_jit::get_env<int>(
-            "DG_BF16_MEGA_MOE_VECTORIZED_GRAD_X_STORE",
-            1) == 1,
-        .wide_grad_x_store = deep_jit::get_env<int>(
-            "DG_BF16_MEGA_MOE_WIDE_GRAD_X_STORE",
-            0) == 1,
+        .vectorized_grad_x_store = vectorized_grad_x_store,
+        .wide_grad_x_store = wide_grad_x_store,
         .kernel_trace =
             kernel_trace.has_value()
             ? reinterpret_cast<uint64_t*>(

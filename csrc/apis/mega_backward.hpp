@@ -155,7 +155,9 @@ static void bf16_mega_moe_backward_dgrad_v2(
         std::nullopt,
     const float situ_beta = 4.0f,
     const float situ_linear_beta = std::numeric_limits<float>::infinity(),
-    const std::optional<torch::Tensor>& w3_weights = std::nullopt) {
+    const std::optional<torch::Tensor>& w3_weights = std::nullopt,
+    const bool vectorized_grad_x_store = true,
+    const bool wide_grad_x_store = false) {
     deep_gemm::sm100_bf16_mega_moe_backward_dgrad(
         gate_up_output, grad_h_output, grad_gate_up_output,
         h_act_output, h_weighted_output, x_pool_output,
@@ -172,7 +174,8 @@ static void bf16_mega_moe_backward_dgrad_v2(
         token_src_metadata,
         backward_sym_buffer_ptrs, backward_rank,
         num_max_tokens_per_rank, num_topk, memory_mode,
-        kernel_trace, situ_beta, situ_linear_beta, w3_weights);
+        kernel_trace, situ_beta, situ_linear_beta, w3_weights,
+        vectorized_grad_x_store, wide_grad_x_store);
 }
 
 static void bf16_mega_moe_backward_dgrad(
@@ -613,7 +616,9 @@ static void register_apis(pybind11::module_& m) {
         py::arg("kernel_trace") = py::none(),
         py::arg("situ_beta") = 4.0f,
         py::arg("situ_linear_beta") = std::numeric_limits<float>::infinity(),
-        py::arg("w3_weights") = py::none());
+        py::arg("w3_weights") = py::none(),
+        py::arg("vectorized_grad_x_store") = true,
+        py::arg("wide_grad_x_store") = false);
     m.def(
         "bf16_mega_moe_backward_dgrad",
         &bf16_mega_moe_backward_dgrad,

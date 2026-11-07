@@ -1,4 +1,3 @@
-import os
 import time
 from typing import Any, Callable, NamedTuple, Optional, Tuple
 
@@ -9,9 +8,7 @@ from .. import _C
 from . import CombineOrderMode, RouteWeightMode, _situ_kwargs
 
 _BF16_BACKWARD_TIMING_HOOK: Optional[Callable[[str, torch.cuda.Event, torch.cuda.Event, float], None]] = None
-_BF16_BACKWARD_KERNEL_TRACE_HOOK: Optional[
-    Callable[[torch.Tensor, float, torch.Tensor, int], None]
-] = None
+_BF16_BACKWARD_KERNEL_TRACE_HOOK: Optional[Callable[[torch.Tensor, float, torch.Tensor, int], None]] = None
 _BF16_BACKWARD_KERNEL_TRACE_SITES = (
     "kernel_total",
     "initial_cluster_arrival",
@@ -47,8 +44,6 @@ _BF16_BACKWARD_KERNEL_TRACE_FIELDS = (
     "sm_id",
 )
 _BF16_BACKWARD_DECOMPOSE_PRELUDE = False
-_BF16_BACKWARD_SPLIT_BARRIER_FUSED_ROUTE = os.getenv("DG_BF16_SPLIT_BARRIER_FUSED_ROUTE", "1") == "1"
-_BF16_ROUTE_PRELUDE_THREADS = os.getenv("DG_BF16_ROUTE_PRELUDE_THREADS", "128")
 
 
 def _timed_cuda_phase(name: str, operation: Callable[[], Any]) -> Any:
@@ -67,7 +62,8 @@ def _timed_cuda_phase(name: str, operation: Callable[[], Any]) -> Any:
 
 
 def _allocate_backward_kernel_trace(
-    sites: tuple[str, ...], device: torch.device,
+    sites: tuple[str, ...],
+    device: torch.device,
 ) -> tuple[torch.Tensor, float]:
     properties = torch.cuda.get_device_properties(device)
     return (
@@ -259,6 +255,11 @@ def bf16_mega_moe_backward_dgrad(
     situ_beta: float = 4.0,
     situ_linear_beta: Optional[float] = None,
     w3_weights: Optional[torch.Tensor] = None,
+    *,
+    split_barrier_fused_route: bool = True,
+    route_prelude_threads: int = 128,
+    vectorized_grad_x_store: bool = True,
+    wide_grad_x_store: bool = False,
 ) -> None:
     """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x.
 
@@ -274,11 +275,24 @@ def bf16_mega_moe_backward_dgrad(
     For SiTU, ``fast_math=True`` uses the hardware tanh approximation in
     backward only. Sigmoid evaluation, FP32 arithmetic order and BF16
     materialization are unchanged. The default retains precise tanh.
+
+    Route-prelude scheduling is configured per call. The defaults preserve
+    the split-barrier fused route prelude and the 128-thread H2048 route dot.
+    Other hidden widths retain their 256-thread prelude.
+    Grad-x publication uses vectorized stores by default. Wider stores can be
+    selected explicitly; neither store policy reads process environment state.
     """
-    situ_kwargs = _situ_kwargs(activation, situ_beta, situ_linear_beta,
-                               route_weight_mode, activation_limit, fast_math,
-                               allow_fast_math=bool(getattr(
-                                   _C, "BF16_MEGAMOE_SITU_FAST_BACKWARD", False)))
+    if route_prelude_threads not in (128, 256):
+        raise ValueError(f"route_prelude_threads must be 128 or 256, got {route_prelude_threads!r}")
+    situ_kwargs = _situ_kwargs(
+        activation,
+        situ_beta,
+        situ_linear_beta,
+        route_weight_mode,
+        activation_limit,
+        fast_math,
+        allow_fast_math=bool(getattr(_C, "BF16_MEGAMOE_SITU_FAST_BACKWARD", False)),
+    )
     # With a separate up weight, w13_weights is the gate tensor [E, I, H].
     # Preserve the packed ABI when callers do not request this layout.
     if w3_weights is not None:
@@ -391,24 +405,9 @@ def bf16_mega_moe_backward_dgrad(
             synchronize_after_dispatch: bool,
             barrier_only: bool = False,
         ) -> None:
-            route_prelude_threads = 256
-            if (
-                compute_route_dot
-                and grad_y.shape[1] == 2048
-                and combine_order_mode is not CombineOrderMode.FIXED_TOPK
-            ):
-                try:
-                    route_prelude_threads = int(_BF16_ROUTE_PRELUDE_THREADS)
-                except ValueError as exc:
-                    raise ValueError(
-                        "DG_BF16_ROUTE_PRELUDE_THREADS must be 128 or 256, got "
-                        f"{_BF16_ROUTE_PRELUDE_THREADS!r}"
-                    ) from exc
-                if route_prelude_threads not in (128, 256):
-                    raise ValueError(
-                        "DG_BF16_ROUTE_PRELUDE_THREADS must be 128 or 256, got "
-                        f"{route_prelude_threads}"
-                    )
+            threads = 256
+            if compute_route_dot and grad_y.shape[1] == 2048 and combine_order_mode is not CombineOrderMode.FIXED_TOPK:
+                threads = route_prelude_threads
             _C.bf16_mega_moe_backward_post_down_prelude_v2(
                 grad_y_unweighted_output,
                 grad_ye,
@@ -434,7 +433,7 @@ def bf16_mega_moe_backward_dgrad(
                 synchronize_after_dispatch,
                 barrier_only,
                 x_prepared,
-                route_prelude_threads,
+                threads,
             )
 
         def launch_decomposed_route_prelude() -> None:
@@ -596,7 +595,7 @@ def bf16_mega_moe_backward_dgrad(
                 if prepare_route_and_weighted and _BF16_BACKWARD_DECOMPOSE_PRELUDE
                 else (
                     launch_split_barrier_fused_route_prelude
-                    if (prepare_route_and_weighted and _BF16_BACKWARD_SPLIT_BARRIER_FUSED_ROUTE)
+                    if (prepare_route_and_weighted and split_barrier_fused_route)
                     else (
                         launch_chunked_route_prelude
                         if prepare_route_and_weighted
@@ -619,10 +618,9 @@ def bf16_mega_moe_backward_dgrad(
     kernel_trace = None
     trace_clock_rate_khz = 0.0
     if kernel_trace_hook is not None:
-        kernel_trace, trace_clock_rate_khz = (
-            _allocate_backward_kernel_trace(
-                _BF16_BACKWARD_KERNEL_TRACE_SITES, grad_y.device,
-            )
+        kernel_trace, trace_clock_rate_khz = _allocate_backward_kernel_trace(
+            _BF16_BACKWARD_KERNEL_TRACE_SITES,
+            grad_y.device,
         )
     _timed_cuda_phase(
         "kernel_a_dgrad",
@@ -663,6 +661,8 @@ def bf16_mega_moe_backward_dgrad(
             combine_order_mode.value,
             memory_mode,
             kernel_trace,
+            vectorized_grad_x_store=vectorized_grad_x_store,
+            wide_grad_x_store=wide_grad_x_store,
             **situ_kwargs,
         ),
     )
@@ -870,18 +870,13 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     route_weight_mode = RouteWeightMode(route_weight_mode)
     if route_weight_mode is RouteWeightMode.POST_DOWN:
         if route_weights.dtype != torch.float32:
-            raise TypeError(
-                "post_down requires FP32 route_weights")
+            raise TypeError("post_down requires FP32 route_weights")
         if grad_y_unweighted_output is None:
-            raise ValueError(
-                "post_down requires grad_y_unweighted_output")
+            raise ValueError("post_down requires grad_y_unweighted_output")
         if down_unweighted_output is None:
-            raise ValueError(
-                "post_down requires saved down_unweighted_output")
+            raise ValueError("post_down requires saved down_unweighted_output")
         if grad_route_output is None and sym_buffer is None:
-            raise ValueError(
-                "post_down without a symmetric buffer requires "
-                "grad_route_output")
+            raise ValueError("post_down without a symmetric buffer requires " "grad_route_output")
     elif grad_y_unweighted_output is None:
         grad_y_unweighted_output = grad_ye
     backward_grad_y = None
@@ -891,11 +886,7 @@ def fp8_fp4_mega_moe_backward_dgrad_swiglu(
     backward_rank = 0
     num_max_tokens_per_rank = 0
     num_topk = 0
-    if (
-        compute_w13_dgrad and
-        not write_grad_x_pool and
-        not direct_remote_grad_x
-    ):
+    if compute_w13_dgrad and not write_grad_x_pool and not direct_remote_grad_x:
         raise ValueError("grad-x requires a local or direct remote output")
     if direct_remote_grad_x and not compute_w13_dgrad:
         raise ValueError("direct remote grad-x requires W13 dgrad")
@@ -1025,23 +1016,17 @@ def _allocate_side_lora_backward_outputs(
         if not saved_x_pool.is_contiguous():
             raise ValueError("saved_x_pool must be contiguous")
         if tuple(saved_x_pool.shape) != (pool_rows, hidden):
-            raise ValueError(
-                "saved_x_pool must have shape "
-                f"{(pool_rows, hidden)}; got {tuple(saved_x_pool.shape)}"
-            )
+            raise ValueError("saved_x_pool must have shape " f"{(pool_rows, hidden)}; got {tuple(saved_x_pool.shape)}")
         x_pool = saved_x_pool
     else:
         x_pool = torch.empty_like(grad_ye)
     if reuse_gate_for_grad_x:
         if gate_up.numel() != pool_rows * hidden:
-            raise ValueError(
-                "gate_up storage cannot cover the grad-x pool"
-            )
+            raise ValueError("gate_up storage cannot cover the grad-x pool")
         grad_x_pool = gate_up.view(pool_rows, hidden)
     else:
         grad_x_pool = torch.empty_like(grad_ye)
-    route_weights = torch.empty(
-        pool_rows, dtype=torch.float32, device=gate_up.device)
+    route_weights = torch.empty(pool_rows, dtype=torch.float32, device=gate_up.device)
     grad_route = torch.empty_like(route_weights)
     t13 = torch.empty((pool_rows, 2, 128), **options)
     t2 = torch.empty((pool_rows, 128), **options)
@@ -1060,8 +1045,17 @@ def _allocate_side_lora_backward_outputs(
         for tensor in side_lora
     )
     return (
-        grad_ye, grad_h, grad_gate_up, h_act, h_weighted, x_pool,
-        grad_x_pool, route_weights, grad_route, t13, t2,
+        grad_ye,
+        grad_h,
+        grad_gate_up,
+        h_act,
+        h_weighted,
+        x_pool,
+        grad_x_pool,
+        route_weights,
+        grad_route,
+        t13,
+        t2,
         grad_side_lora,
     )
 
@@ -1131,45 +1125,70 @@ def bf16_mega_moe_side_lora_backward(
     route_weight_mode = RouteWeightMode(route_weight_mode)
     combine_order_mode = CombineOrderMode(combine_order_mode)
     if route_weight_mode is RouteWeightMode.POST_DOWN:
-        raise NotImplementedError(
-            "BF16 side-LoRA backward currently supports pre_down routing only")
+        raise NotImplementedError("BF16 side-LoRA backward currently supports pre_down routing only")
     if len(side_lora) != 6 or side_lora[0].size(0) != 128:
         raise ValueError("side_lora must be a rank-128 transformed tuple")
     if direct_remote_grad_x is None:
         direct_remote_grad_x = sym_buffer.group.size() > 1
     if not write_grad_x_pool:
         raise ValueError("side-LoRA backward requires write_grad_x_pool=True")
-    block_m = _side_backward_block_m(
-        block_m, sym_buffer, grad_y.device, rank_uniform_block_m)
+    block_m = _side_backward_block_m(block_m, sym_buffer, grad_y.device, rank_uniform_block_m)
     # The native specialization materializes the base dgrad pool, folds both
     # side branches into it, then publishes the final value once. This is the
     # ordinary base-dgrad output, not an additional side-LoRA wide scratch.
     outputs = (
         _allocate_side_lora_backward_outputs(
-            gate_up_output, side_lora, w13_weights.size(2),
-            w2_weights.size(2), write_grad_x_pool,
-            saved_x_pool=saved_x_pool)
-        if out is None else (
-            out.grad_ye, out.grad_h, out.grad_gate_up, out.h_act,
-            out.h_weighted, out.x_pool, out.grad_x_pool,
-            out.route_weights, out.grad_route, out.t13, out.t2,
-            out.grad_side_lora)
+            gate_up_output,
+            side_lora,
+            w13_weights.size(2),
+            w2_weights.size(2),
+            write_grad_x_pool,
+            saved_x_pool=saved_x_pool,
+        )
+        if out is None
+        else (
+            out.grad_ye,
+            out.grad_h,
+            out.grad_gate_up,
+            out.h_act,
+            out.h_weighted,
+            out.x_pool,
+            out.grad_x_pool,
+            out.route_weights,
+            out.grad_route,
+            out.t13,
+            out.t2,
+            out.grad_side_lora,
+        )
     )
-    (grad_ye, grad_h, grad_gate_up, h_act, h_weighted, x_pool,
-     grad_x_pool, route_weights, grad_route, t13, t2,
-     grad_side_lora) = outputs
+    (
+        grad_ye,
+        grad_h,
+        grad_gate_up,
+        h_act,
+        h_weighted,
+        x_pool,
+        grad_x_pool,
+        route_weights,
+        grad_route,
+        t13,
+        t2,
+        grad_side_lora,
+    ) = outputs
     if saved_x_pool is not None and x_pool.data_ptr() != saved_x_pool.data_ptr():
         raise ValueError("out.x_pool must alias saved_x_pool when it is provided")
-    sym_buffer.backward_grad_y[:grad_y.size(0)].copy_(
-        grad_y.to(torch.bfloat16).contiguous())
+    sym_buffer.backward_grad_y[: grad_y.size(0)].copy_(grad_y.to(torch.bfloat16).contiguous())
     sym_buffer.backward_grad_route.zero_()
     num_grid_states = (
-        expert_counts.numel() *
-        ((w13_weights.size(2) // 64) * (w2_weights.size(2) // 128) +
-         (w13_weights.size(1) // 64) * (w13_weights.size(2) // 128)) + 2)
+        expert_counts.numel()
+        * (
+            (w13_weights.size(2) // 64) * (w2_weights.size(2) // 128)
+            + (w13_weights.size(1) // 64) * (w13_weights.size(2) // 128)
+        )
+        + 2
+    )
     if grid_sync_counter is None:
-        grid_sync_counter = torch.zeros(
-            num_grid_states, dtype=torch.int32, device=gate_up_output.device)
+        grid_sync_counter = torch.zeros(num_grid_states, dtype=torch.int32, device=gate_up_output.device)
     if expert_psum_rows is None:
         expert_psum_rows = padded_expert_counts.cumsum(0).to(torch.int32)
     # Publish and pull grad-y/x/route metadata before the rank shrink. The
@@ -1177,40 +1196,88 @@ def bf16_mega_moe_side_lora_backward(
     # so it does not repeat communication. This is a native CUDA prelude; no
     # framework GEMM participates in the production backward.
     _C.bf16_mega_moe_backward_post_down_prelude_v2(
-        grad_ye, grad_ye, x_pool, route_weights, grad_route,
-        saved_down_unweighted, expert_counts,
-        sym_buffer.backward_grad_y, sym_buffer.x,
-        sym_buffer.topk_weights, sym_buffer.backward_grad_route,
-        sym_buffer.token_src_metadata, sym_buffer.handle.buffer_ptrs,
-        sym_buffer.group.rank(), sym_buffer.num_topk, block_m,
-        combine_order_mode.value, True, False, False, True, True,
-        False, saved_x_pool is not None, 256)
+        grad_ye,
+        grad_ye,
+        x_pool,
+        route_weights,
+        grad_route,
+        saved_down_unweighted,
+        expert_counts,
+        sym_buffer.backward_grad_y,
+        sym_buffer.x,
+        sym_buffer.topk_weights,
+        sym_buffer.backward_grad_route,
+        sym_buffer.token_src_metadata,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
+        sym_buffer.num_topk,
+        block_m,
+        combine_order_mode.value,
+        True,
+        False,
+        False,
+        True,
+        True,
+        False,
+        saved_x_pool is not None,
+        256,
+    )
     kernel_trace_hook = _BF16_BACKWARD_KERNEL_TRACE_HOOK
     kernel_trace = None
     trace_clock_rate_khz = 0.0
     if kernel_trace_hook is not None:
-        kernel_trace, trace_clock_rate_khz = (
-            _allocate_backward_kernel_trace(
-                _BF16_SIDE_LORA_BACKWARD_KERNEL_TRACE_SITES,
-                grad_y.device,
-            )
+        kernel_trace, trace_clock_rate_khz = _allocate_backward_kernel_trace(
+            _BF16_SIDE_LORA_BACKWARD_KERNEL_TRACE_SITES,
+            grad_y.device,
         )
     _C.bf16_mega_moe_side_lora_backward(
-        gate_up_output, grad_h, grad_gate_up, h_act, h_weighted,
-        x_pool, grad_x_pool, grad_route, grad_ye, grad_ye,
-        route_weights, w2_weights, w13_weights, expert_counts,
-        grid_sync_counter, float(activation_limit), activation,
-        bool(fast_math), route_weight_mode.value,
-        combine_order_mode.value, saved_down_unweighted, block_m,
+        gate_up_output,
+        grad_h,
+        grad_gate_up,
+        h_act,
+        h_weighted,
+        x_pool,
+        grad_x_pool,
+        grad_route,
+        grad_ye,
+        grad_ye,
+        route_weights,
+        w2_weights,
+        w13_weights,
+        expert_counts,
+        grid_sync_counter,
+        float(activation_limit),
+        activation,
+        bool(fast_math),
+        route_weight_mode.value,
+        combine_order_mode.value,
+        saved_down_unweighted,
+        block_m,
         bool(direct_remote_grad_x),
-        bool(write_grad_x_pool), True,
-        sym_buffer.backward_grad_y, sym_buffer.x,
-        sym_buffer.topk_weights, sym_buffer.backward_grad_route,
-        sym_buffer.token_src_metadata, sym_buffer.handle.buffer_ptrs,
-        sym_buffer.group.rank(), sym_buffer.num_max_tokens_per_rank,
-        sym_buffer.num_topk, "dispatch_prepared", *side_lora, q13, q2, saved_h,
-        t13, t2, *grad_side_lora, expert_psum_rows,
-        padded_expert_counts, float(side_lora_scale), kernel_trace)
+        bool(write_grad_x_pool),
+        True,
+        sym_buffer.backward_grad_y,
+        sym_buffer.x,
+        sym_buffer.topk_weights,
+        sym_buffer.backward_grad_route,
+        sym_buffer.token_src_metadata,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_topk,
+        "dispatch_prepared",
+        *side_lora,
+        q13,
+        q2,
+        saved_h,
+        t13,
+        t2,
+        *grad_side_lora,
+        expert_psum_rows,
+        padded_expert_counts,
+        float(side_lora_scale),
+        kernel_trace,
+    )
     if kernel_trace_hook is not None:
         kernel_trace_hook(
             kernel_trace,
@@ -1220,15 +1287,23 @@ def bf16_mega_moe_side_lora_backward(
         )
     grad_x = None
     if direct_remote_grad_x and combine_grad_x:
-        grad_x = (
-            torch.empty_like(grad_y, dtype=torch.bfloat16)
-            if out is None or out.grad_x is None else out.grad_x)
-        mega_moe_backward_combine_grad_x(
-            grad_x, sym_buffer, combine_order_mode)
+        grad_x = torch.empty_like(grad_y, dtype=torch.bfloat16) if out is None or out.grad_x is None else out.grad_x
+        mega_moe_backward_combine_grad_x(grad_x, sym_buffer, combine_order_mode)
     return MegaMoESideLoraBackwardResult(
-        grad_x_pool, grad_x, grad_route, grad_ye, grad_h,
-        grad_gate_up, h_act, h_weighted, x_pool, route_weights,
-        t13, t2, grad_side_lora)
+        grad_x_pool,
+        grad_x,
+        grad_route,
+        grad_ye,
+        grad_h,
+        grad_gate_up,
+        h_act,
+        h_weighted,
+        x_pool,
+        route_weights,
+        t13,
+        t2,
+        grad_side_lora,
+    )
 
 
 def fp8_fp4_mega_moe_side_lora_backward(
@@ -1275,26 +1350,21 @@ def fp8_fp4_mega_moe_side_lora_backward(
         raise ValueError(f"unsupported activation: {activation}")
     route_weight_mode = RouteWeightMode(route_weight_mode)
     if route_weight_mode is RouteWeightMode.POST_DOWN:
-        raise NotImplementedError(
-            "MXFP4 side-LoRA backward currently supports pre_down routing only")
+        raise NotImplementedError("MXFP4 side-LoRA backward currently supports pre_down routing only")
     if len(side_lora) != 6 or side_lora[0].size(0) != 128:
         raise ValueError("side_lora must be a rank-128 transformed tuple")
     if direct_remote_grad_x is None:
         direct_remote_grad_x = sym_buffer.group.size() > 1
     if not write_grad_x_pool:
         raise ValueError("side-LoRA backward requires write_grad_x_pool=True")
-    block_m = _side_backward_block_m(
-        block_m, sym_buffer, grad_y.device, rank_uniform_block_m)
+    block_m = _side_backward_block_m(block_m, sym_buffer, grad_y.device, rank_uniform_block_m)
     hidden = w2_weights[0].size(1)
     intermediate_hidden = w2_dequant_scratch.size(2)
     expected_down_shape = (gate_up_output.size(0), hidden)
     if saved_down_unweighted.dtype != torch.bfloat16:
         raise TypeError("saved_down_unweighted must be BF16")
     if saved_down_unweighted.device != gate_up_output.device:
-        raise ValueError(
-            "saved_down_unweighted must be on the same device as "
-            "gate_up_output"
-        )
+        raise ValueError("saved_down_unweighted must be on the same device as " "gate_up_output")
     if not saved_down_unweighted.is_contiguous():
         raise ValueError("saved_down_unweighted must be contiguous")
     if tuple(saved_down_unweighted.shape) != expected_down_shape:
@@ -1305,80 +1375,159 @@ def fp8_fp4_mega_moe_side_lora_backward(
         )
     outputs = (
         _allocate_side_lora_backward_outputs(
-            gate_up_output, side_lora, hidden, intermediate_hidden,
+            gate_up_output,
+            side_lora,
+            hidden,
+            intermediate_hidden,
             write_grad_x_pool,
             reuse_gate_for_grad_x=reuse_gate_for_grad_x,
-            saved_x_pool=saved_x_pool)
-        if out is None else (
-            out.grad_ye, out.grad_h, out.grad_gate_up, out.h_act,
-            out.h_weighted, out.x_pool, out.grad_x_pool,
-            out.route_weights, out.grad_route, out.t13, out.t2,
-            out.grad_side_lora)
+            saved_x_pool=saved_x_pool,
+        )
+        if out is None
+        else (
+            out.grad_ye,
+            out.grad_h,
+            out.grad_gate_up,
+            out.h_act,
+            out.h_weighted,
+            out.x_pool,
+            out.grad_x_pool,
+            out.route_weights,
+            out.grad_route,
+            out.t13,
+            out.t2,
+            out.grad_side_lora,
+        )
     )
-    (grad_ye, grad_h, grad_gate_up, h_act, h_weighted, x_pool,
-     grad_x_pool, route_weights, grad_route, t13, t2,
-     grad_side_lora) = outputs
+    (
+        grad_ye,
+        grad_h,
+        grad_gate_up,
+        h_act,
+        h_weighted,
+        x_pool,
+        grad_x_pool,
+        route_weights,
+        grad_route,
+        t13,
+        t2,
+        grad_side_lora,
+    ) = outputs
     if saved_x_pool is not None and x_pool.data_ptr() != saved_x_pool.data_ptr():
         raise ValueError("out.x_pool must alias saved_x_pool when it is provided")
     if reuse_gate_for_grad_x:
-        if (
-            grad_x_pool.data_ptr() != gate_up_output.data_ptr()
-            or grad_x_pool.numel() != gate_up_output.numel()
-        ):
-            raise ValueError(
-                "reuse_gate_grad_x requires grad_x_pool to reuse gate_up"
-            )
-    sym_buffer.backward_grad_y[:grad_y.size(0)].copy_(
-        grad_y.to(torch.bfloat16).contiguous())
+        if grad_x_pool.data_ptr() != gate_up_output.data_ptr() or grad_x_pool.numel() != gate_up_output.numel():
+            raise ValueError("reuse_gate_grad_x requires grad_x_pool to reuse gate_up")
+    sym_buffer.backward_grad_y[: grad_y.size(0)].copy_(grad_y.to(torch.bfloat16).contiguous())
     sym_buffer.backward_grad_route.zero_()
     num_grid_states = (
-        expert_counts.numel() *
-        ((hidden // 64) * (intermediate_hidden // 128) +
-         ((2 * intermediate_hidden) // 64) * (hidden // 128)) + 2)
+        expert_counts.numel()
+        * ((hidden // 64) * (intermediate_hidden // 128) + ((2 * intermediate_hidden) // 64) * (hidden // 128))
+        + 2
+    )
     if grid_sync_counter is None:
-        grid_sync_counter = torch.zeros(
-            num_grid_states, dtype=torch.int32, device=gate_up_output.device)
+        grid_sync_counter = torch.zeros(num_grid_states, dtype=torch.int32, device=gate_up_output.device)
     if expert_psum_rows is None:
         expert_psum_rows = padded_expert_counts.cumsum(0).to(torch.int32)
     _C.bf16_mega_moe_backward_post_down_prelude_v2(
-        grad_ye, grad_ye, x_pool, route_weights, grad_route,
-        saved_down_unweighted, expert_counts,
-        sym_buffer.backward_grad_y, sym_buffer.side_lora_source,
-        sym_buffer.topk_weights, sym_buffer.backward_grad_route,
-        sym_buffer.token_src_metadata, sym_buffer.handle.buffer_ptrs,
-        sym_buffer.group.rank(), sym_buffer.num_topk, block_m,
-        CombineOrderMode.FIXED_TOPK.value, True, False,
-        False, True, True, False, saved_x_pool is not None, 256)
-    _C.fp8_fp4_mega_moe_side_lora_backward(
-        gate_up_output, grad_h, grad_gate_up, h_act, h_weighted,
-        x_pool, grad_x_pool, l1_acts, l1_acts_sf,
-        l1_weights[0], l1_weights[1], grad_ye, route_weights,
-        w2_weights[0], w2_weights[1], w2_dequant_scratch,
-        w13_weights[0], w13_weights[1], w13_dequant_scratch,
-        expert_counts, grid_sync_counter, float(activation_limit),
-        activation, bool(fast_math), True,
-        bool(direct_remote_grad_x),
-        bool(write_grad_x_pool), True, block_m,
+        grad_ye,
+        grad_ye,
+        x_pool,
+        route_weights,
+        grad_route,
+        saved_down_unweighted,
+        expert_counts,
+        sym_buffer.backward_grad_y,
+        sym_buffer.side_lora_source,
+        sym_buffer.topk_weights,
+        sym_buffer.backward_grad_route,
+        sym_buffer.token_src_metadata,
         sym_buffer.handle.buffer_ptrs,
-        sym_buffer.group.rank(), sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.group.rank(),
         sym_buffer.num_topk,
-        sym_buffer.backward_grad_y, sym_buffer.topk_weights,
-        sym_buffer.backward_grad_route, sym_buffer.token_src_metadata,
-        route_weight_mode.value, grad_ye, saved_down_unweighted,
-        grad_route, *side_lora, q13, q2, saved_h, t13, t2,
-        *grad_side_lora, expert_psum_rows, padded_expert_counts,
-        float(side_lora_scale))
+        block_m,
+        CombineOrderMode.FIXED_TOPK.value,
+        True,
+        False,
+        False,
+        True,
+        True,
+        False,
+        saved_x_pool is not None,
+        256,
+    )
+    _C.fp8_fp4_mega_moe_side_lora_backward(
+        gate_up_output,
+        grad_h,
+        grad_gate_up,
+        h_act,
+        h_weighted,
+        x_pool,
+        grad_x_pool,
+        l1_acts,
+        l1_acts_sf,
+        l1_weights[0],
+        l1_weights[1],
+        grad_ye,
+        route_weights,
+        w2_weights[0],
+        w2_weights[1],
+        w2_dequant_scratch,
+        w13_weights[0],
+        w13_weights[1],
+        w13_dequant_scratch,
+        expert_counts,
+        grid_sync_counter,
+        float(activation_limit),
+        activation,
+        bool(fast_math),
+        True,
+        bool(direct_remote_grad_x),
+        bool(write_grad_x_pool),
+        True,
+        block_m,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_topk,
+        sym_buffer.backward_grad_y,
+        sym_buffer.topk_weights,
+        sym_buffer.backward_grad_route,
+        sym_buffer.token_src_metadata,
+        route_weight_mode.value,
+        grad_ye,
+        saved_down_unweighted,
+        grad_route,
+        *side_lora,
+        q13,
+        q2,
+        saved_h,
+        t13,
+        t2,
+        *grad_side_lora,
+        expert_psum_rows,
+        padded_expert_counts,
+        float(side_lora_scale),
+    )
     grad_x = None
     if direct_remote_grad_x and combine_grad_x:
-        grad_x = (
-            torch.empty_like(grad_y, dtype=torch.bfloat16)
-            if out is None or out.grad_x is None else out.grad_x)
-        mega_moe_backward_combine_grad_x(
-            grad_x, sym_buffer, CombineOrderMode.FIXED_TOPK)
+        grad_x = torch.empty_like(grad_y, dtype=torch.bfloat16) if out is None or out.grad_x is None else out.grad_x
+        mega_moe_backward_combine_grad_x(grad_x, sym_buffer, CombineOrderMode.FIXED_TOPK)
     return MegaMoESideLoraBackwardResult(
-        grad_x_pool, grad_x, grad_route, grad_ye, grad_h,
-        grad_gate_up, h_act, h_weighted, x_pool, route_weights,
-        t13, t2, grad_side_lora)
+        grad_x_pool,
+        grad_x,
+        grad_route,
+        grad_ye,
+        grad_h,
+        grad_gate_up,
+        h_act,
+        h_weighted,
+        x_pool,
+        route_weights,
+        t13,
+        t2,
+        grad_side_lora,
+    )
 
 
 def bf16_mega_moe_backward_w2(
@@ -1446,11 +1595,7 @@ def mega_moe_backward_combine_grad_x(
         sym_buffer.num_topk,
         num_ranks,
         sym_buffer.num_experts // num_ranks,
-        (
-            None
-            if combine_order_mode is CombineOrderMode.FIXED_TOPK
-            else sym_buffer.topk_idx
-        ),
+        (None if combine_order_mode is CombineOrderMode.FIXED_TOPK else sym_buffer.topk_idx),
         combine_order_mode.value,
     )
 
