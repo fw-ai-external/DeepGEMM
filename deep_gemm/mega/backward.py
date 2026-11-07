@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from typing import Any, Callable, NamedTuple, Optional, Tuple
@@ -107,6 +108,8 @@ def _validate_bf16_backward_alias_contract(
     grad_ye: torch.Tensor,
     grad_y_unweighted_output: torch.Tensor,
     down_unweighted_output: torch.Tensor,
+    activation: str = "swiglu",
+    activation_limit: float = float("inf"),
 ) -> None:
     """Validate every overlapping BF16 pool against the phase contract."""
     if memory_mode not in ("legacy", "phase_ordered"):
@@ -165,9 +168,13 @@ def _validate_bf16_backward_alias_contract(
         else:
             required_exact = (
                 ("grad_ye", grad_ye, "grad_y_unweighted", grad_y_unweighted_output),
-                ("h_act", h_act_output, "h_weighted", h_weighted_output),
                 ("grad_gate_up", grad_gate_up_output, "gate_up", gate_up_output),
             )
+            if activation != "swiglu" or not math.isfinite(activation_limit):
+                required_exact += (("h_act", h_act_output, "h_weighted", h_weighted_output),)
+            # Clamped PRE_DOWN requires disjoint activation/weighted planes.
+            # No overlap is allowed below: one plane cannot retain both the
+            # route-gradient activation and the once-rounded W2 input.
         for lhs_name, lhs, rhs_name, rhs in required_exact:
             if not _exact_alias(lhs, rhs):
                 raise ValueError(
@@ -263,7 +270,8 @@ def bf16_mega_moe_backward_dgrad(
     requires ``grad_ye == down_unweighted``, a ``grad_h`` prefix view of
     ``grad_y_unweighted``, ``h_act == h_weighted == grad_h``, and
     ``grad_gate_up == gate_up``. PRE_DOWN requires
-    ``grad_y_unweighted == grad_ye``, ``h_act == h_weighted``, and
+    ``grad_y_unweighted == grad_ye``, ``h_act == h_weighted`` (except
+    finite-clamped SwiGLU, which requires disjoint planes), and
     ``grad_gate_up == gate_up``. Logical tensors whose storage is reused are
     no longer observable after this call. ``"legacy"`` keeps independent
     storage, apart from the historical semantic aliases validated above.
@@ -307,6 +315,8 @@ def bf16_mega_moe_backward_dgrad(
         grad_ye=grad_ye,
         grad_y_unweighted_output=grad_y_unweighted_output,
         down_unweighted_output=down_unweighted_output,
+        activation=activation,
+        activation_limit=activation_limit,
     )
     if sym_buffer.group.size() > 1 and not rank_uniform_block_m:
         # BLOCK_M determines the persistent grid shape and therefore every
