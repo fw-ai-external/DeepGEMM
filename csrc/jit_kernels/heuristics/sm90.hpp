@@ -94,6 +94,14 @@ struct SM90ArchSpec {
                         if (block_m > 128 and block_n > 128)
                             continue;
 
+                        // 1D2D at block M 128 x block N 192 spills under its 168-register cap when the compiled-in K
+                        // has a multiple of 4 K blocks from 8 up, where ptxas unrolls the K loop further (nvcc 13.3)
+                        const int num_k_blocks = ceil_div(desc.k, block_k);
+                        if (desc.kernel_type == KernelType::Kernel1D2D and block_m > 64 and block_n > 160 and
+                            desc.compiled_dims.find('k') != std::string::npos and not heuristics_runtime->get_ignore_compile_dims() and
+                            num_k_blocks >= 8 and num_k_blocks % 4 == 0)
+                            continue;
+
                         // Calculate swizzling
                         const auto layout = Layout{0, block_m, block_n, block_k, cluster_m, cluster_n};
                         const auto storage_config = get_storage_config(desc, layout);
