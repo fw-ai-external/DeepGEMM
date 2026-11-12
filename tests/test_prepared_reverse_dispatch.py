@@ -88,12 +88,13 @@ def test_prepared_reuse_keeps_rank_barriers_and_route_clear(prepared):
                                bf16_mega_moe_backward_dgrad_v2=kernel)
     before_grad = args["grad_ye"].clone()
     before_weights = args["route_weights"].clone()
+    cuda_initialized_before = torch.cuda.is_initialized()
     with pytest.raises(KernelReached):
         ns["bf16_mega_moe_backward_dgrad"](**args, reverse_dispatch_prepared=prepared)
     torch.testing.assert_close(args["grad_ye"], before_grad, rtol=0, atol=0)
     torch.testing.assert_close(args["route_weights"], before_weights, rtol=0, atol=0)
     assert torch.all(sym.backward_grad_y[:4] == (7 if prepared else 9))
-    assert not torch.cuda.is_initialized()
+    assert torch.cuda.is_initialized() == cuda_initialized_before
 
 
 @pytest.mark.parametrize("override", [dict(x_prepared=False), dict(memory_mode="legacy"),
