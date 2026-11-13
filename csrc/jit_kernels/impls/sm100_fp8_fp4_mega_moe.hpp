@@ -251,7 +251,9 @@ static void sm100_fp8_fp4_mega_moe(
     const auto num_sms = get_mega_moe_num_sms();
 
     // Compile
+    const int fast_combine = deep_jit::get_env<int>("DG_MEGA_MOE_FAST_COMBINE", 1);
     const auto kernel = jit->compile("sm100_fp8_fp4_mega_moe", std::format(R"(
+#define DG_MEGA_MOE_FAST_COMBINE {}
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -276,7 +278,7 @@ static void __instantiate_kernel() {{
         {}, {}, {}, {}, {}, {}, {}, {}
     >);
 }};
-)", num_max_tokens_per_rank,
+)", fast_combine, num_max_tokens_per_rank,
         hidden, intermediate_hidden,
         num_experts, num_shared_experts,
         num_topk,

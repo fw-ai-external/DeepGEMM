@@ -1646,6 +1646,77 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         const auto grid_idx = ptx::get_grid_idx() + 1;
+#ifndef DG_MEGA_MOE_FAST_COMBINE
+#define DG_MEGA_MOE_FAST_COMBINE 1
+#endif
+        if constexpr (DG_MEGA_MOE_FAST_COMBINE != 0 and kNumSharedExperts == 0 and kNumTopk <= 12 and
+                      (kNumHiddenBytes % (8 * 32 * sizeof(uint4)) == 0)) {
+            if (num_tokens <= 128) {
+                constexpr uint32_t kFastChunks = 8;
+                constexpr uint32_t kFastChunkBytes = kNumHiddenBytes / kFastChunks;
+                constexpr uint32_t kFastUint4PerLane = (kFastChunkBytes / sizeof(uint4)) / 32;
+                for (uint32_t tc_idx = epilogue_warp_idx * kNumSMs + sm_idx;
+                     tc_idx < num_tokens * kFastChunks;
+                     tc_idx += kNumSMs * kNumEpilogueWarps) {
+                    const uint32_t token_idx = tc_idx / kFastChunks;
+                    const uint32_t chunk_idx = tc_idx % kFastChunks;
+                    const int stored_topk_slot_idx = lane_idx < kNumTopk
+                        ? static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_idx * kNumTopk + lane_idx])
+                        : -1;
+                    const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
+                    const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
+                    const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
+                        is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
+                    comm::wait_until(
+                        [&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+                        [&]() { printf("DeepGEMM fast combine timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+
+                    const uint32_t chunk_byte_offset = chunk_idx * kFastChunkBytes;
+                    uint4 prefetched[kNumTopk][kFastUint4PerLane];
+                    #pragma unroll
+                    for (uint32_t k = 0; k < kNumTopk; ++k) {
+                        if (total_mask & (1u << k)) {
+                            const auto base_ptr = math::advance_ptr<const uint4>(
+                                buffer.combine_token_buffer.get_rank_buffer(k).get_data_buffer(token_idx).get_base_ptr(),
+                                chunk_byte_offset);
+                            #pragma unroll
+                            for (uint32_t j = 0; j < kFastUint4PerLane; ++j) {
+                                uint4 v;
+                                const uint4* p = base_ptr + j * 32 + lane_idx;
+                                asm volatile("ld.global.cv.v4.u32 {%0, %1, %2, %3}, [%4];"
+                                             : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+                                prefetched[k][j] = v;
+                            }
+                        }
+                    }
+                    float2 reduced[kFastUint4PerLane * kNumElemsPerUint4] = {};
+                    #pragma unroll
+                    for (uint32_t k = 0; k < kNumTopk; ++k) {
+                        if (total_mask & (1u << k)) {
+                            #pragma unroll
+                            for (uint32_t j = 0; j < kFastUint4PerLane; ++j) {
+                                const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&prefetched[k][j]);
+                                #pragma unroll
+                                for (uint32_t l = 0; l < kNumElemsPerUint4; ++l)
+                                    ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                            }
+                        }
+                    }
+                    auto dst_base = math::advance_ptr<uint4>(
+                        y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk_byte_offset);
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kFastUint4PerLane; ++j) {
+                        uint4 casted;
+                        auto casted_bf16 = reinterpret_cast<nv_bfloat162*>(&casted);
+                        #pragma unroll
+                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++l)
+                            casted_bf16[l] = __float22bfloat162_rn(reduced[j * kNumElemsPerUint4 + l]);
+                        dst_base[j * 32 + lane_idx] = casted;
+                    }
+                }
+                return;
+            }
+        }
         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
