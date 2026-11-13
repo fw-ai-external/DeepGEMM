@@ -3298,8 +3298,19 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                       static_cast<float>(
                                           grad_h_w2) *
                                       route_weight);
+                            // Clamped BF16 SwiGLU fuses route multiplication
+                            // into the FP32 VJP. Do not insert a BF16 round.
+                            const bool clamped_swiglu =
+                                kBF16Mode &&
+                                kActivationType == ActivationType::SwiGLU &&
+                                activation_limit !=
+                                    cute::numeric_limits<float>::infinity();
                             const float grad_h =
-                                static_cast<float>(grad_h_bf16);
+                                clamped_swiglu &&
+                                        kRouteWeightMode == RouteWeightMode::PreDown
+                                ? __fmul_rn(static_cast<float>(grad_h_w2),
+                                            route_weight)
+                                : static_cast<float>(grad_h_bf16);
                             // This is the W2 dgrad output before any pre-down
                             // route multiplication. In post-down mode its GEMM
                             // input was already weighted BF16 grad-y.
@@ -3410,6 +3421,7 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                             const float sig =
                                 1.0f / denom;
                             cd_dtype_t h_act_bf16;
+                            float h_act_fp32 = 0.0f;
                             cd_dtype_t grad_gate_bf16;
                             cd_dtype_t grad_up_bf16;
                             if constexpr (
@@ -3467,47 +3479,25 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                                     float>(
                                                     silu_bf16)));
                                 } else {
-                                    const float
-                                        activated_gate =
-                                            __fmul_rn(
-                                                gate, sig);
-                                    h_act_bf16 =
-                                        cd_dtype_t(
-                                            __fmul_rn(
-                                                activated_gate,
-                                                up));
-                                    const float
-                                        one_minus_sig =
-                                            __fsub_rn(
-                                                1.0f, sig);
-                                    const float gate_sig =
-                                        __fmul_rn(
-                                            gate, sig);
-                                    const float
-                                        activation_grad =
-                                            __fadd_rn(
-                                                sig,
-                                                __fmul_rn(
-                                                    __fmul_rn(
-                                                        gate_sig,
-                                                        one_minus_sig),
-                                                    dz_dgate));
-                                    grad_gate_bf16 =
-                                        cd_dtype_t(
-                                            gate_in_range
-                                            ? __fmul_rn(
-                                                  __fmul_rn(
-                                                      grad_h,
-                                                      up),
-                                                  activation_grad)
-                                            : 0.0f);
-                                    grad_up_bf16 =
-                                        cd_dtype_t(
-                                            up_in_range
-                                            ? __fmul_rn(
-                                                  grad_h,
-                                                  activated_gate)
-                                            : 0.0f);
+                                    // Same FP32 boundaries/expression as native
+                                    // exact clamped SwiGLU, including SiLU VJP.
+                                    const float activated_gate = gate / denom;
+                                    h_act_fp32 =
+                                        __fmul_rn(activated_gate, up);
+                                    h_act_bf16 = cd_dtype_t(h_act_fp32);
+                                    const float silu_factor = __fmaf_rn(
+                                        gate, __fsub_rn(1.0f, sig), 1.0f);
+                                    grad_gate_bf16 = cd_dtype_t(
+                                        gate_in_range
+                                        ? __fmul_rn(
+                                              __fmul_rn(
+                                                  __fmul_rn(grad_h, up), sig),
+                                              silu_factor)
+                                        : 0.0f);
+                                    grad_up_bf16 = cd_dtype_t(
+                                        up_in_range
+                                        ? __fmul_rn(grad_h, activated_gate)
+                                        : 0.0f);
                                 }
                             } else {
                                 const float activated_gate =
@@ -3568,10 +3558,11 @@ sm100_fp8_fp4_mega_moe_backward_wave_impl(
                                     kRouteWeightMode ==
                                             RouteWeightMode::PostDown
                                     ? h_act_bf16
-                                    : cd_dtype_t(
-                                          static_cast<float>(
-                                              h_act_bf16) *
-                                          route_weight);
+                                    : cd_dtype_t(__fmul_rn(
+                                          clamped_swiglu
+                                          ? h_act_fp32
+                                          : static_cast<float>(h_act_bf16),
+                                          route_weight));
                             }
                             grad_gate_up_output[
                                 static_cast<uint64_t>(

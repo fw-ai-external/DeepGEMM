@@ -454,6 +454,11 @@ def bf16_mega_moe(y: torch.Tensor,
                   shared_l2_weights: Optional[torch.Tensor] = None):
     """Run BF16 MegaMoE with an explicit route-weight boundary.
 
+    ``y`` is BF16 by default. An explicitly supplied FP32 output is supported
+    only with FIXED_TOPK combine, preserving the routed accumulator for a
+    caller that adds a shared expert before final BF16 rounding. The BF16
+    specialization and all defaults are unchanged.
+
     The optional stage saves expose unweighted/weighted activation and W2
     output boundaries for strict parity checks. The fused backward currently
     supports the production ``pre_down`` route-weight boundary only.

@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from typing import Any, Callable, NamedTuple, Optional, Tuple
@@ -107,6 +108,8 @@ def _validate_bf16_backward_alias_contract(
     grad_ye: torch.Tensor,
     grad_y_unweighted_output: torch.Tensor,
     down_unweighted_output: torch.Tensor,
+    activation: str = "swiglu",
+    activation_limit: float = float("inf"),
 ) -> None:
     """Validate every overlapping BF16 pool against the phase contract."""
     if memory_mode not in ("legacy", "phase_ordered"):
@@ -165,9 +168,13 @@ def _validate_bf16_backward_alias_contract(
         else:
             required_exact = (
                 ("grad_ye", grad_ye, "grad_y_unweighted", grad_y_unweighted_output),
-                ("h_act", h_act_output, "h_weighted", h_weighted_output),
                 ("grad_gate_up", grad_gate_up_output, "gate_up", gate_up_output),
             )
+            if activation != "swiglu" or not math.isfinite(activation_limit):
+                required_exact += (("h_act", h_act_output, "h_weighted", h_weighted_output),)
+            # Clamped PRE_DOWN requires disjoint activation/weighted planes.
+            # No overlap is allowed below: one plane cannot retain both the
+            # route-gradient activation and the once-rounded W2 input.
         for lhs_name, lhs, rhs_name, rhs in required_exact:
             if not _exact_alias(lhs, rhs):
                 raise ValueError(
@@ -256,6 +263,7 @@ def bf16_mega_moe_backward_dgrad(
     memory_mode: str = "legacy",
     rank_uniform_block_m: bool = False,
     x_prepared: bool = False,
+    reverse_dispatch_prepared: bool = False,
 ) -> None:
     """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x.
 
@@ -263,10 +271,18 @@ def bf16_mega_moe_backward_dgrad(
     requires ``grad_ye == down_unweighted``, a ``grad_h`` prefix view of
     ``grad_y_unweighted``, ``h_act == h_weighted == grad_h``, and
     ``grad_gate_up == gate_up``. PRE_DOWN requires
-    ``grad_y_unweighted == grad_ye``, ``h_act == h_weighted``, and
+    ``grad_y_unweighted == grad_ye``, ``h_act == h_weighted`` (except
+    finite-clamped SwiGLU, which requires disjoint planes), and
     ``grad_gate_up == gate_up``. Logical tensors whose storage is reused are
     no longer observable after this call. ``"legacy"`` keeps independent
     storage, apart from the historical semantic aliases validated above.
+
+    ``reverse_dispatch_prepared`` consumes the exact PRE_DOWN grad-y, x and
+    route-weight pools from an earlier synchronized input prelude on the same
+    stream. The caller must preserve the forward's physical row order and
+    finish both rank barriers before calling this function. We still clear
+    the route-gradient source plane and synchronize ranks before direct grad-x
+    writes; only the redundant source copy and reverse pull are omitted.
     """
     route_weight_mode = RouteWeightMode(route_weight_mode)
     combine_order_mode = CombineOrderMode(combine_order_mode)
@@ -284,6 +300,12 @@ def bf16_mega_moe_backward_dgrad(
         raise ValueError("Python numerical correction does not support destructive " "phase-ordered aliases")
     if x_prepared and memory_mode != "phase_ordered":
         raise ValueError("prepared x pool requires phase_ordered memory")
+    if reverse_dispatch_prepared and (
+        not x_prepared
+        or memory_mode != "phase_ordered"
+        or route_weight_mode is not RouteWeightMode.PRE_DOWN
+    ):
+        raise ValueError("prepared reverse dispatch requires prepared x and PRE_DOWN phase_ordered memory")
     if route_weight_mode is RouteWeightMode.POST_DOWN:
         if grad_y_unweighted_output is None:
             raise ValueError("post_down requires grad_y_unweighted_output")
@@ -307,6 +329,8 @@ def bf16_mega_moe_backward_dgrad(
         grad_ye=grad_ye,
         grad_y_unweighted_output=grad_y_unweighted_output,
         down_unweighted_output=down_unweighted_output,
+        activation=activation,
+        activation_limit=activation_limit,
     )
     if sym_buffer.group.size() > 1 and not rank_uniform_block_m:
         # BLOCK_M determines the persistent grid shape and therefore every
@@ -329,7 +353,7 @@ def bf16_mega_moe_backward_dgrad(
         "grad_route_plane_clear",
         sym_buffer.backward_grad_route.zero_,
     )
-    if direct_remote_grad_x:
+    if direct_remote_grad_x and not reverse_dispatch_prepared:
         # Kernel A reuses this region as [topk, token, hidden] direct-write
         # planes after every rank has pulled grad-y from plane zero. Clear all
         # planes so masked routes and repeated backward calls reduce as zero.
@@ -350,7 +374,7 @@ def bf16_mega_moe_backward_dgrad(
             "grad_y_expose_copy",
             lambda: backward_grad_y[0, :num_tokens].copy_(grad_y.to(torch.bfloat16).contiguous()),
         )
-    else:
+    elif not reverse_dispatch_prepared:
         _timed_cuda_phase(
             "grad_y_expose_copy",
             lambda: backward_grad_y[:num_tokens].copy_(grad_y.to(torch.bfloat16).contiguous()),
@@ -570,32 +594,48 @@ def bf16_mega_moe_backward_dgrad(
                 ),
             )
 
-        _timed_cuda_phase(
-            ("reverse_dispatch_route_prelude" if prepare_route_and_weighted else "reverse_dispatch_input_prelude"),
-            (
-                launch_decomposed_route_prelude
-                if prepare_route_and_weighted and _BF16_BACKWARD_DECOMPOSE_PRELUDE
-                else (
-                    launch_split_barrier_fused_route_prelude
-                    if (prepare_route_and_weighted and _BF16_BACKWARD_SPLIT_BARRIER_FUSED_ROUTE)
+        if reverse_dispatch_prepared:
+            # The earlier input prelude completed all pulls. These barriers
+            # publish every rank's route-plane clear before Kernel A starts
+            # writing remote grad-x/route outputs. Do not read grad-y again.
+            _timed_cuda_phase(
+                "prepared_reverse_dispatch_barrier",
+                lambda: launch_prelude(
+                    do_reverse_dispatch=False,
+                    compute_route_dot=False,
+                    write_weighted=False,
+                    synchronize_ranks=True,
+                    synchronize_after_dispatch=True,
+                    barrier_only=True,
+                ),
+            )
+        else:
+            _timed_cuda_phase(
+                ("reverse_dispatch_route_prelude" if prepare_route_and_weighted else "reverse_dispatch_input_prelude"),
+                (
+                    launch_decomposed_route_prelude
+                    if prepare_route_and_weighted and _BF16_BACKWARD_DECOMPOSE_PRELUDE
                     else (
-                        launch_chunked_route_prelude
-                        if prepare_route_and_weighted
+                        launch_split_barrier_fused_route_prelude
+                        if (prepare_route_and_weighted and _BF16_BACKWARD_SPLIT_BARRIER_FUSED_ROUTE)
                         else (
-                            launch_decomposed_input_prelude
-                            if _BF16_BACKWARD_DECOMPOSE_PRELUDE
-                            else lambda: launch_prelude(
-                                do_reverse_dispatch=True,
-                                compute_route_dot=False,
-                                write_weighted=False,
-                                synchronize_ranks=True,
-                                synchronize_after_dispatch=True,
+                            launch_chunked_route_prelude
+                            if prepare_route_and_weighted
+                            else (
+                                launch_decomposed_input_prelude
+                                if _BF16_BACKWARD_DECOMPOSE_PRELUDE
+                                else lambda: launch_prelude(
+                                    do_reverse_dispatch=True,
+                                    compute_route_dot=False,
+                                    write_weighted=False,
+                                    synchronize_ranks=True,
+                                    synchronize_after_dispatch=True,
+                                )
                             )
                         )
                     )
-                )
-            ),
-        )
+                ),
+            )
     kernel_trace_hook = _BF16_BACKWARD_KERNEL_TRACE_HOOK
     kernel_trace = None
     trace_clock_rate_khz = 0.0

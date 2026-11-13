@@ -1508,8 +1508,17 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         } else {
             DG_HOST_ASSERT(exact_alias(
                 grad_ye, grad_y_unweighted_output));
-            DG_HOST_ASSERT(exact_alias(
-                h_act_output, h_weighted_output));
+            if (activation == "swiglu" &&
+                activation_limit !=
+                    cute::numeric_limits<float>::infinity()) {
+                // Finite-clamped PRE_DOWN keeps FP32 activation*route
+                // until its single BF16 store; the route plane is separate.
+                DG_HOST_ASSERT(!overlaps(
+                    h_act_output, h_weighted_output));
+            } else {
+                DG_HOST_ASSERT(exact_alias(
+                    h_act_output, h_weighted_output));
+            }
         }
     }
 

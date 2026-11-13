@@ -570,7 +570,8 @@ static void bf16_mega_moe(
     DG_HOST_ASSERT(is_localized(l1_weights) == is_localized(l2_weights));
     DG_HOST_ASSERT(l1_weights.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(l2_weights.scalar_type() == torch::kBFloat16);
-    DG_HOST_ASSERT(y.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(y.scalar_type() == torch::kBFloat16 || y.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(y.scalar_type() != torch::kFloat32 || combine_order_mode == "fixed_topk");
     DG_HOST_ASSERT(y.is_contiguous());
     DG_HOST_ASSERT(y.sizes() == torch::IntArrayRef({num_tokens, hidden}));
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);

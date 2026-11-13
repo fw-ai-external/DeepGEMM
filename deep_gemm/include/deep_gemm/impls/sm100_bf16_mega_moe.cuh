@@ -41,6 +41,7 @@ template <
     CombineOrderMode kCombineOrderMode,
     bool kSaveDownUnweighted,
     bool kSaveX,
+    bool kOutputFp32 = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -869,7 +870,7 @@ sm100_bf16_mega_moe_impl(void* y,
                 issue_and_wait_pull_store(kNumChunks - 1);
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
                 ptx::red_add_rel(
-                    workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 
+                    workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
                     is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
                 );
             }
@@ -2108,32 +2109,51 @@ sm100_bf16_mega_moe_impl(void* y,
                         }
                     }
                 }
-            // Cast
-            #pragma unroll
-            for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
-                uint4 casted;
-                auto casted_bf16 = reinterpret_cast<nv_bfloat162*>(&casted);
+            if constexpr (kOutputFp32) {
+                // DSV4.1 adds its BF16 shared expert to this FP32 routed
+                // accumulator before the final BF16 materialization.
+                // Keep the fixed top-k sum without an intermediate round.
+                auto* output = static_cast<float*>(y) +
+                    static_cast<uint64_t>(token_idx) * kHidden +
+                    chunk_byte_offset / sizeof(nv_bfloat16);
                 #pragma unroll
-                for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
-                    casted_bf16[l] = __float22bfloat162_rn(reduced[j * kNumElemsPerUint4 + l]);
-
-                // Wait share memory release and write
-                if (j == 0) {
-                    ptx::tma_store_wait<0>();
-                    __syncwarp();
+                for (uint32_t j = 0; j < kNumUint4PerLane; ++j) {
+                    #pragma unroll
+                    for (uint32_t l = 0; l < kNumElemsPerUint4; ++l) {
+                        const uint32_t element = (j * 32 + lane_idx) *
+                            (sizeof(uint4) / sizeof(nv_bfloat16)) + l * 2;
+                        *reinterpret_cast<float2*>(output + element) =
+                            reduced[j * kNumElemsPerUint4 + l];
+                    }
                 }
-                ptx::st_shared(combine_store_buffer + j * 32 + lane_idx,
-                               casted.x, casted.y, casted.z, casted.w);
-            }
-            __syncwarp();
+            } else {
+                // Cast
+                #pragma unroll
+                for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                    uint4 casted;
+                    auto casted_bf16 = reinterpret_cast<nv_bfloat162*>(&casted);
+                    #pragma unroll
+                    for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
+                        casted_bf16[l] = __float22bfloat162_rn(reduced[j * kNumElemsPerUint4 + l]);
 
-            // TMA store the token chunk
-            if (cute::elect_one_sync()) {
-                cute::tma_store_fence();
-                ptx::tma_store_1d(
-                    math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk_byte_offset),
-                    combine_store_buffer, kNumChunkBytes);
-                cute::tma_store_arrive();
+                    // Wait share memory release and write
+                    if (j == 0) {
+                        ptx::tma_store_wait<0>();
+                        __syncwarp();
+                    }
+                    ptx::st_shared(combine_store_buffer + j * 32 + lane_idx,
+                                   casted.x, casted.y, casted.z, casted.w);
+                }
+                __syncwarp();
+
+                // TMA store the token chunk
+                if (cute::elect_one_sync()) {
+                    cute::tma_store_fence();
+                    ptx::tma_store_1d(
+                        math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk_byte_offset),
+                        combine_store_buffer, kNumChunkBytes);
+                    cute::tma_store_arrive();
+                }
             }
             __syncwarp();
         }
