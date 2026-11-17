@@ -1646,10 +1646,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         const auto grid_idx = ptx::get_grid_idx() + 1;
-#ifndef DG_MEGA_MOE_FAST_COMBINE
-#define DG_MEGA_MOE_FAST_COMBINE 1
-#endif
-        if constexpr (DG_MEGA_MOE_FAST_COMBINE != 0 and kNumSharedExperts == 0 and kNumTopk <= 12 and
+        if constexpr (kNumSharedExperts == 0 and kNumTopk <= 12 and
                       (kNumHiddenBytes % (8 * 32 * sizeof(uint4)) == 0)) {
             if (num_tokens <= 128) {
                 constexpr uint32_t kFastChunks = 8;
