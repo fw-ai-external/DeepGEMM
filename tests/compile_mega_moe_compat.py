@@ -67,6 +67,17 @@ def cases():
                 args += [training, training]
                 header = f"sm100_{kind}_mega_moe"
                 yield f"{kind}_m{block_m}_s{shared}_t{int(training)}", header, header + "_impl", args
+                if kind == "bf16" and shared == 0:
+                    yield (f"separate_fwd_m{block_m}_t{int(training)}", header, header + "_impl",
+                           args + ["4.0f", "__builtin_inff()", True])
+                if kind == "bf16" and training:
+                    for linear_beta in ("__builtin_inff()", "8.0f", "25.0f"):
+                        situ_args = args.copy()
+                        situ_args[situ_args.index("ActivationType::GeGLU")] = "ActivationType::SiTU"
+                        situ_args += ["4.0f", linear_beta]
+                        suffix = "unbounded" if linear_beta == "__builtin_inff()" else f"linear{linear_beta[:-3]}"
+                        yield f"situ_fwd_m{block_m}_{suffix}", header, header + "_impl", situ_args
+                        yield f"situ_fwd_separate_m{block_m}_{suffix}", header, header + "_impl", situ_args + [True]
                 if kind == "fp8_fp4" and not training:
                     fp8_args = args.copy()
                     fp8_args[fp8_args.index("cutlass::detail::float_e2m1_unpacksmem_t")] = "cutlass::float_e4m3_t"
@@ -81,6 +92,23 @@ def cases():
                     False, False, True, True, True, True]
             yield (f"backward_b{int(bf16)}_m{block_m}", "sm100_fp8_fp4_mega_moe_backward",
                    "sm100_fp8_fp4_mega_moe_backward_wave_impl", args)
+
+            if bf16:
+                for activation in ("GeGLU", "SwiGLU"):
+                    separate_args = args.copy()
+                    separate_args[separate_args.index("ActivationType::GeGLU")] = f"ActivationType::{activation}"
+                    separate_args += [False, False, False, "4.0f", "__builtin_inff()", True]
+                    yield (f"separate_bwd_m{block_m}_{activation}", "sm100_fp8_fp4_mega_moe_backward",
+                           "sm100_fp8_fp4_mega_moe_backward_wave_impl", separate_args)
+                for linear_beta in ("__builtin_inff()", "8.0f"):
+                    situ_args = args.copy()
+                    situ_args[situ_args.index("ActivationType::GeGLU")] = "ActivationType::SiTU"
+                    situ_args += [False, False, False, "4.0f", linear_beta]
+                    suffix = "linear" if linear_beta == "8.0f" else "unbounded"
+                    yield (f"situ_bwd_m{block_m}_{suffix}", "sm100_fp8_fp4_mega_moe_backward",
+                           "sm100_fp8_fp4_mega_moe_backward_wave_impl", situ_args)
+                    yield (f"situ_bwd_separate_m{block_m}_{suffix}", "sm100_fp8_fp4_mega_moe_backward",
+                           "sm100_fp8_fp4_mega_moe_backward_wave_impl", situ_args + [True])
 
     for combine in (False, True):
         args = ["cute::UMMA::Major::MN", "cute::UMMA::Major::MN", 512, 256, 0,
@@ -110,11 +138,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nvcc", default="nvcc")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--case-prefix", default="")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parents[1]
     count = 0
     for name, header, function, template_args in cases():
+        if not name.startswith(args.case_prefix):
+            continue
         source = args.output_dir / f"{name}.cu"
         parameters = ", ".join(str(value).lower() if isinstance(value, bool) else str(value)
                                for value in template_args)

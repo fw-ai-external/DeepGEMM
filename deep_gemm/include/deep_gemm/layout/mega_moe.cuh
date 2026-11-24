@@ -55,8 +55,6 @@ struct alignas(128) MegaMoESignals {
     static constexpr uint32_t kNumMaxGridSyncCounters = 4;
     static constexpr uint32_t kNumMaxExperts = 2048;
     static constexpr uint32_t kNumMaxExpertsPerRank = 512;
-    static constexpr uint32_t kNumMaxRingBlocks = 1u << 20;  // 20 MiB for the ring signals
-    static constexpr uint32_t kNumMaxSharedL2Blocks = 1u << 15;  // 128 KiB
 
     // Grid and NVLink synchronization
     uint32_t grid_sync_count[kNumMaxGridSyncCounters];
@@ -79,14 +77,8 @@ struct alignas(128) MegaMoESignals {
     uint64_t expert_recv_count[kNumMaxExperts];
     uint64_t expert_recv_count_sum[kNumMaxExpertsPerRank];
 
-    // Routed-expert ring signals, `l2_full_mask` has one bit per L1 N block
-    uint32_t l1_full_count[kNumMaxRingBlocks];
-    uint32_t l1_empty_count[kNumMaxRingBlocks];
-    uint64_t l2_full_mask[kNumMaxRingBlocks];
-    uint32_t l2_empty_count[kNumMaxRingBlocks];
-
-    // Shared-expert signals
-    uint32_t shared_l2_full_count[kNumMaxSharedL2Blocks];
+    // Ring and shared-expert signals follow this control prefix. Workspace
+    // sizes them from the context capacity, independently of the active length.
 };
 DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_grid_idx) == 128, "Invalid control signal layout");
 
@@ -95,6 +87,7 @@ struct Workspace {
     uint32_t num_ranks, num_experts;
     uint32_t num_experts_per_rank;
     uint32_t num_max_tokens_per_rank;
+    uint32_t num_ring_signal_blocks;
     uint32_t num_shared_l2_pool_blocks;
 
     // Full-pool span used by non-ring token metadata
@@ -114,6 +107,7 @@ struct Workspace {
         num_max_tokens_per_rank(num_max_tokens_per_rank) {
         num_experts_per_rank = num_experts / num_ranks;
         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+        num_ring_signal_blocks = math::ceil_div<uint64_t>(num_ring_tokens, kMinCandidateBlockM);
         num_shared_l2_pool_blocks = math::ceil_div<uint32_t>(num_max_tokens_per_rank, kMinCandidateBlockM);
 
         DG_UNIFIED_ASSERT(num_ranks > 0);
@@ -121,16 +115,28 @@ struct Workspace {
         DG_UNIFIED_ASSERT(num_experts % num_ranks == 0);
         DG_UNIFIED_ASSERT(num_experts <= MegaMoESignals::kNumMaxExperts);
         DG_UNIFIED_ASSERT(num_experts_per_rank <= MegaMoESignals::kNumMaxExpertsPerRank);
-        DG_UNIFIED_ASSERT(num_ring_tokens <= MegaMoESignals::kNumMaxRingBlocks * kMinCandidateBlockM);
-        DG_UNIFIED_ASSERT(num_shared_l2_pool_blocks <= MegaMoESignals::kNumMaxSharedL2Blocks);
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_ring_signal_stride_bytes() const {
+        return math::align<uint64_t>(static_cast<uint64_t>(num_ring_signal_blocks) * sizeof(uint32_t), 128);
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_num_signal_bytes() const {
+        // Four ring arrays: three uint32 counters and one uint64 mask.
+        // Each region starts on a separate 128-byte boundary. The uint64 mask
+        // occupies two uint32 strides, including any alignment padding.
+        return sizeof(MegaMoESignals) + 5 * get_ring_signal_stride_bytes()
+            + math::align<uint64_t>(static_cast<uint64_t>(num_shared_l2_pool_blocks) * sizeof(uint32_t), 128);
     }
 
     CUTLASS_HOST_DEVICE
     uint64_t get_num_bytes() const {
         uint64_t num_bytes = 0;
 
-        // Fixed-position global and expert signals
-        num_bytes += sizeof(MegaMoESignals);
+        // Fixed-position control prefix and capacity-sized signal regions.
+        num_bytes += get_num_signal_bytes();
 
         // Source token-topk: [local expert][source rank][token], with distinct experts per token
         num_bytes += num_experts * num_max_tokens_per_rank * sizeof(uint32_t);
@@ -217,27 +223,27 @@ struct Workspace {
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_l1_full_count_ptr(const uint32_t& ring_block_idx = 0) const {
-        return signals->l1_full_count + ring_block_idx;
+        return math::advance_ptr<uint32_t>(signals, sizeof(MegaMoESignals)) + ring_block_idx;
     }
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_l1_empty_count_ptr(const uint32_t& ring_block_idx = 0) const {
-        return signals->l1_empty_count + ring_block_idx;
+        return math::advance_ptr<uint32_t>(signals, sizeof(MegaMoESignals) + get_ring_signal_stride_bytes()) + ring_block_idx;
     }
 
     CUTLASS_DEVICE
     uint64_t* get_l2_full_mask_ptr(const uint32_t& ring_block_idx = 0) const {
-        return signals->l2_full_mask + ring_block_idx;
+        return math::advance_ptr<uint64_t>(signals, sizeof(MegaMoESignals) + 2 * get_ring_signal_stride_bytes()) + ring_block_idx;
     }
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_l2_empty_count_ptr(const uint32_t& ring_block_idx = 0) const {
-        return signals->l2_empty_count + ring_block_idx;
+        return math::advance_ptr<uint32_t>(signals, sizeof(MegaMoESignals) + 4 * get_ring_signal_stride_bytes()) + ring_block_idx;
     }
 
     CUTLASS_DEVICE
     uint32_t* get_shared_l2_full_count_ptr(const uint32_t& block_idx = 0) const {
-        return signals->shared_l2_full_count + block_idx;
+        return math::advance_ptr<uint32_t>(signals, sizeof(MegaMoESignals) + 5 * get_ring_signal_stride_bytes()) + block_idx;
     }
 
     // For dispatch pulling
@@ -245,7 +251,7 @@ struct Workspace {
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
         const auto offset = (expert_idx * num_ranks + rank_idx) * num_max_tokens_per_rank + token_idx;
-        return math::advance_ptr<uint32_t>(signals, sizeof(MegaMoESignals)) + offset;
+        return math::advance_ptr<uint32_t>(signals, get_num_signal_bytes()) + offset;
     }
 
     // For combine usages (full)

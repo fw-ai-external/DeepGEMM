@@ -8,6 +8,7 @@
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
+#include <deep_gemm/scheduler/bounded_lag_moe.cuh>
 
 // TODO: add MegaMoE namespace
 namespace deep_gemm::sched {
@@ -176,7 +177,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
           uint32_t kNumL1Clusters = kNumL1BlockNs / 2,
-          uint32_t kNumL2Clusters = kNumL2BlockNs / 2>
+          uint32_t kNumL2Clusters = kNumL2BlockNs / 2,
+          uint32_t kL2LagUnits = 0>
 struct MegaMoEScheduler {
     static constexpr bool kHasShared = kNumSharedExperts > 0;
     static constexpr uint32_t SHARED_L1_SHAPE_N = L1_SHAPE_N * kNumSharedExperts;
@@ -219,6 +221,7 @@ struct MegaMoEScheduler {
     // Per-scheduler warmup waves; all CTA-pair schedulers together form one global wave.
     static constexpr uint32_t kNumSchedL1WavesDone = 0xffffffffu;
     uint32_t num_sched_l1_waves = 0;
+    BoundedLagCursor<kNumExpertsPerRank, BLOCK_M, kNumL1Clusters, kNumL2Clusters, kL2LagUnits> lag_cursor;
 
     // Locality domain affinity. When a queue is drained, we try work stealing to ensure load balancing.
     // But when there are few tasks, we disable work stealing to avoid cross-die latency.
@@ -370,6 +373,18 @@ struct MegaMoEScheduler {
     }
 
     CUTLASS_DEVICE task_info_t get_next_task() {
+        if constexpr (kL2LagUnits > 0) {
+            // One ordered stream for routed work across both locality domains.
+            // Shared-expert queues retain their existing domain affinity.
+            const uint32_t ticket = get_next_local_task_idx(workspace.get_l1_task_count_ptr(), 0);
+            if (ticket >= num_total_m_blocks * (kNumL1Clusters + kNumL2Clusters))
+                return task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0);
+            const auto task = lag_cursor.next(ticket, [&](uint32_t expert) { return get_num_tokens(expert); });
+            const bool is_l2 = task.phase == 2;
+            return task_info_t(is_l2 ? BlockPhase::Linear2 : BlockPhase::Linear1,
+                              task.expert, task.m, task.n, task.pool_block, task.valid_m,
+                              is_l2 ? L2_SHAPE_N : L1_SHAPE_N, is_l2 ? L2_SHAPE_K : L1_SHAPE_K);
+        }
         uint32_t m_block_idx, n_cluster_idx;
         while (true) {
             if (num_sched_l1_waves != kNumSchedL1WavesDone and num_sched_l1_waves) {

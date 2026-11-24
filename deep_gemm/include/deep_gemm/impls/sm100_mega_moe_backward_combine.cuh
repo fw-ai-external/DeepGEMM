@@ -76,6 +76,39 @@ CUTLASS_GLOBAL void sm100_mega_moe_backward_combine_grad_x(
             for (uint32_t slot = 0; slot < num_topk; ++slot)
                 accumulate_slot(values, slot);
         } else {
+            // H3584 contains 224 vectors/token: every participating warp
+            // owns one token, including odd token counts and the final warp.
+            // Keep scalar fallback for other layouts, launch sizes and modes.
+            if (kNumRanks == 6 && kNumLocalExperts == 150 &&
+                kCombineOrderMode == CombineOrderMode::DeepEP &&
+                hidden == 3584 && num_topk == 16 && blockDim.x % 32 == 0) {
+                constexpr uint32_t full_warp = 0xffffffffu;
+                const uint32_t lane = threadIdx.x & 31u;
+                const int64_t expert = lane < num_topk
+                    ? topk_ids[static_cast<uint64_t>(token_idx) * num_topk + lane]
+                    : -1;
+                const int owner = expert >= 0 ? static_cast<int>(expert / kNumLocalExperts) : -1;
+                const uint32_t same_owner = __match_any_sync(full_warp, owner);
+                const uint32_t own_mask = owner >= 0 ? same_owner : 0u;
+                for (uint32_t last_slot = 0; last_slot < num_topk; ++last_slot) {
+                    uint32_t rank_mask = __shfl_sync(full_warp, own_mask, last_slot);
+                    // DeepEP visits owners by their last occurrence in top-k.
+                    // Every lane sees the same mask and takes the same branch.
+                    if (!rank_mask || 31u - __clz(rank_mask) != last_slot)
+                        continue;
+                    float rank_values[kValuesPerVector] = {0.0f};
+                    while (rank_mask) {
+                        const uint32_t selected_slot = __ffs(rank_mask) - 1;
+                        rank_mask &= rank_mask - 1;
+                        accumulate_slot(rank_values, selected_slot);
+                    }
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kValuesPerVector; ++i) {
+                        const cutlass::bfloat16_t rank_partial(rank_values[i]);
+                        values[i] += static_cast<float>(rank_partial);
+                    }
+                }
+            } else {
             DG_DEVICE_ASSERT(topk_ids != nullptr);
             DG_DEVICE_ASSERT(num_topk <= 32);
             const uint32_t num_rank_iterations =
@@ -167,6 +200,7 @@ CUTLASS_GLOBAL void sm100_mega_moe_backward_combine_grad_x(
                     values[i] +=
                         static_cast<float>(rank_partial);
                 }
+            }
             }
         }
 

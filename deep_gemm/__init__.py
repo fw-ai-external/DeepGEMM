@@ -15,6 +15,14 @@ except ImportError:
 
 # Configs
 from . import _C
+
+BF16_MEGAMOE_SITU = bool(getattr(_C, "BF16_MEGAMOE_SITU", False))
+BF16_MEGAMOE_SITU_FAST_BACKWARD = bool(getattr(_C, "BF16_MEGAMOE_SITU_FAST_BACKWARD", False))
+BF16_MEGAMOE_SITU_PRECISE_PIPELINE = bool(getattr(_C, "BF16_MEGAMOE_SITU_PRECISE_PIPELINE", False))
+BF16_MEGAMOE_SEPARATE_W13 = bool(getattr(_C, "BF16_MEGAMOE_SEPARATE_W13", False))
+BF16_MEGAMOE_SPLIT_BACKWARD = bool(getattr(_C, "BF16_MEGAMOE_SPLIT_BACKWARD", False))
+BF16_MEGAMOE_COMPACT_SPLIT_BACKWARD = bool(getattr(_C, "BF16_MEGAMOE_COMPACT_SPLIT_BACKWARD", False))
+BF16_MEGAMOE_SEPARATE_L1 = bool(getattr(_C, "BF16_MEGAMOE_SEPARATE_L1", False))
 from ._C import (
     shutdown,
     set_num_sms,
