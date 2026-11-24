@@ -19,6 +19,8 @@ static std::string get_bf16_activation_type_name(
         return "ActivationType::SwiGLU";
     if (activation == "geglu")
         return "ActivationType::GeGLU";
+    if (activation == "situ")
+        return "ActivationType::SiTU";
     DG_HOST_UNREACHABLE("Unsupported activation");
 }
 
@@ -69,8 +71,11 @@ static void sm100_bf16_mega_moe(
     const std::optional<torch::Tensor>& precomputed_route_counts,
     const std::optional<int>& active_pool_rows,
     const std::optional<torch::Tensor>& route_count_mismatch,
-    const std::optional<torch::Tensor>& saved_x
-) {
+    const std::optional<torch::Tensor>& saved_x,
+    const float situ_beta, const float situ_linear_beta,
+    const std::optional<torch::Tensor>& l1_up_weights,
+    const bool bounded_lag,
+    const std::optional<int>& num_sms_opt = std::nullopt) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
@@ -144,7 +149,9 @@ static void sm100_bf16_mega_moe(
                                                      config.block_k, config.load_block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
-    const auto tensor_map_l1_weights = make_tma_weights_3d_desc(l1_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode);
+    const auto tensor_map_l1_weights = make_tma_weights_3d_desc(
+        l1_weights, config.block_k, l1_up_weights.has_value() ? 8 : config.load_block_n,
+        config.swizzle_weights_mode);
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, config.num_ring_tokens,
                                                        config.block_n / 2, config.store_block_m_l1,
@@ -172,8 +179,12 @@ static void sm100_bf16_mega_moe(
         config.block_k, config.load_block_m,
         static_cast<int>(shared_l1_acts.stride(-2)),
         config.swizzle_acts_mode) : tensor_map_l1_acts;
-    const auto tensor_map_shared_l1_weights = num_shared_experts > 0 ?
-        make_tma_weights_2d_desc(shared_l1_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode) : tensor_map_l1_weights;
+    // The separate routed layout borrows the unused shared-expert descriptor.
+    const auto tensor_map_shared_l1_weights = l1_up_weights.has_value()
+        ? make_tma_weights_3d_desc(*l1_up_weights, config.block_k, 8, config.swizzle_weights_mode)
+        : num_shared_experts > 0
+            ? make_tma_weights_2d_desc(shared_l1_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode)
+            : tensor_map_l1_weights;
     const auto tensor_map_shared_l1_output = num_shared_experts > 0 ? make_tma_2d_desc(
         shared_l2_acts,
         shared_intermediate_hidden, num_max_tokens_per_rank,
@@ -194,7 +205,7 @@ static void sm100_bf16_mega_moe(
     if (cumulative_local_expert_recv_stats.has_value())
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
 
-    const auto num_sms = get_mega_moe_num_sms();
+    const auto num_sms = resolve_mega_moe_num_sms(num_sms_opt);
 
     // Compile
     const auto kernel = jit->compile("sm100_bf16_mega_moe", std::format(R"(
@@ -216,7 +227,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
-        {}, {}, {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -234,7 +245,10 @@ static void __instantiate_kernel() {{
         fast_math ? "true" : "false",
         get_bf16_activation_type_name(activation), saved_l1_preact.has_value(),
         saved_h_unweighted.has_value(), get_route_weight_mode_name(route_weight_mode),
-        get_combine_order_mode_name(combine_order_mode), saved_down_unweighted.has_value(), saved_x.has_value()));
+        get_combine_order_mode_name(combine_order_mode), saved_down_unweighted.has_value(), saved_x.has_value(),
+        to_string(situ_beta), to_string(situ_linear_beta), l1_up_weights.has_value(),
+        num_sms == jit->device.get_num_sms(),
+        bounded_lag ? sched::get_bounded_lag_units(num_max_tokens_per_rank, num_topk, num_experts_per_rank) : 0));
 
     // Launch
     jit->launch(

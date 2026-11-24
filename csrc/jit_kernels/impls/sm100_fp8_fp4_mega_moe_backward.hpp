@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cmath>
+#include <limits>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -98,6 +101,8 @@ public:
         bool barrier_only = false;
         bool x_prepared = false;
         int route_prelude_threads = 256;
+        bool skip_unweighted_padding = false;
+        uint32_t* dy_block_ready = nullptr;
         const int* expert_counts;
         layout::Workspace backward_workspace;
         layout::SymBuffer<> backward_sym_buffer;
@@ -125,11 +130,13 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
-        &sm100_bf16_mega_moe_backward_post_down_prelude<
-            {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+        &{}<
+            {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
         >);
 }};
 )",
+            args.dy_block_ready ? "sm100_bf16_mega_moe_backward_post_down_prelude_pipeline"
+                                : "sm100_bf16_mega_moe_backward_post_down_prelude",
             args.hidden, args.num_experts, args.block_m,
             args.num_sms, args.num_ranks,
             get_backward_combine_order_mode_name(
@@ -142,10 +149,20 @@ static void __instantiate_kernel() {{
             args.synchronize_after_dispatch ? "true" : "false",
             args.barrier_only ? "true" : "false",
             args.x_prepared ? "true" : "false",
-            args.route_prelude_threads);
+            args.route_prelude_threads,
+            args.skip_unweighted_padding ? "true" : "false",
+            args.dy_block_ready ? "true" : "false");
     }
 
     static void launch(const auto& kernel, const Args& args) {
+        // This specialization is used only by the private PDL producer.
+        // Match the large consumer's shared-memory partition without changing
+        // per-CTA allocation, device arithmetic, or the serial specialization.
+        if (args.dy_block_ready != nullptr) {
+            DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuFuncSetAttribute(
+                kernel->kernel_handle, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                CU_SHAREDMEM_CARVEOUT_MAX_SHARED));
+        }
         jit->launch(
             kernel, args.launch_args,
             args.expert_counts,
@@ -163,7 +180,8 @@ static void __instantiate_kernel() {{
             args.x_pool_output,
             args.route_weights_output,
             args.down_unweighted,
-            args.grad_route_output);
+            args.grad_route_output,
+            args.dy_block_ready);
     }
 };
 
@@ -185,7 +203,10 @@ public:
         int num_sms;
         int num_ranks;
         bool bf16_mode = false;
+        bool separate_w13 = false;
         std::string activation = "swiglu";
+        float situ_beta = 4.0f;
+        float situ_linear_beta = std::numeric_limits<float>::infinity();
         bool fast_math = false;
         std::string route_weight_mode = "pre_down";
         std::string combine_order_mode = "fixed_topk";
@@ -248,6 +269,8 @@ public:
         uint64_t* kernel_trace = nullptr;
         bool inputs_prepared = false;
         bool dispatch_inputs_prepared = false;
+        bool consume_dy_blocks = false;
+        int backward_phase = 0;
         deep_jit::cuda::LaunchOptions launch_args;
     };
 
@@ -259,7 +282,7 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(
-        &sm100_fp8_fp4_mega_moe_backward_wave_impl<
+        &{}<
             {}, {},
             {},
             {}, {}, {},
@@ -281,10 +304,12 @@ static void __instantiate_kernel() {{
             {},
             {},
             {},
-            {}
+            {}, {}, {}, {}, 128, 128, {}, {}, {}
         >);
 }};
 )",
+            args.consume_dy_blocks ? "sm100_fp8_fp4_mega_moe_backward_wave_impl_pipeline"
+                                   : "sm100_fp8_fp4_mega_moe_backward_wave_impl",
             args.hidden, args.intermediate_hidden,
             args.num_experts,
             args.block_m, args.block_n, args.block_k,
@@ -296,7 +321,7 @@ static void __instantiate_kernel() {{
             args.bf16_mode ? "true" : "false",
             args.activation == "geglu"
                 ? "ActivationType::GeGLU"
-                : "ActivationType::SwiGLU",
+                : (args.activation == "situ" ? "ActivationType::SiTU" : "ActivationType::SwiGLU"),
             args.fast_math ? "true" : "false",
             get_backward_route_weight_mode_name(
                 args.route_weight_mode),
@@ -310,7 +335,11 @@ static void __instantiate_kernel() {{
             args.compute_route_grad ? "true" : "false",
             args.trace_kernel ? "true" : "false",
             args.vectorized_grad_x_store ? "true" : "false",
-            args.wide_grad_x_store ? "true" : "false");
+            args.wide_grad_x_store ? "true" : "false",
+            to_string(args.situ_beta), to_string(args.situ_linear_beta),
+            args.separate_w13 ? "true" : "false",
+            args.launch_args.block_dim->x,
+            args.consume_dy_blocks ? "true" : "false", args.backward_phase);
     }
 
     static void launch(const auto& kernel, const Args& args) {
@@ -902,7 +931,8 @@ static void sm100_mega_moe_backward_combine_grad_x(
     const int& num_topk,
     const int& num_ranks,
     const int& num_local_experts,
-    const std::string& combine_order_mode) {
+    const std::string& combine_order_mode,
+    const std::optional<int>& num_sms_opt = std::nullopt) {
     const auto [num_tokens, hidden] =
         get_shape<2>(grad_x_output);
     DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
@@ -937,7 +967,21 @@ static void sm100_mega_moe_backward_combine_grad_x(
         DG_HOST_ASSERT(topk_ids->size(1) == num_topk);
     }
 
-    const int num_sms = get_mega_moe_num_sms();
+    const int num_sms = resolve_mega_moe_num_sms(num_sms_opt);
+    // This grid-stride reduction has no cross-CTA dependencies. Supply
+    // enough independent blocks to hide load latency on the K3.1 EP8 path.
+    // Keep runtime lengths out of generated code and cap empty/tiny grids.
+    const bool use_kimi_grid =
+        jit->device.get_arch_minor() == 3 && hidden == 3584 &&
+        ((num_ranks == 8 && num_local_experts == 112) ||
+         (num_ranks == 6 && num_local_experts == 150)) && num_topk == 16 &&
+        combine_order_mode == "deepep";
+    const int64_t work_blocks =
+        (static_cast<int64_t>(num_tokens) * (hidden / 16) + 255) / 256;
+    const int num_blocks = use_kimi_grid
+        ? static_cast<int>(std::max<int64_t>(1, std::min<int64_t>(
+              static_cast<int64_t>(num_sms) * 8, work_blocks)))
+        : num_sms;
     const SM100MegaMoEBackwardCombineRuntime::Args args = {
         .num_ranks = num_ranks,
         .num_local_experts = num_local_experts,
@@ -957,7 +1001,7 @@ static void sm100_mega_moe_backward_combine_grad_x(
             static_cast<uint32_t>(num_max_tokens),
         .num_topk = static_cast<uint32_t>(num_topk),
         .hidden = static_cast<uint32_t>(hidden),
-        .launch_args = make_mega_moe_launch_options(num_sms, 256),
+        .launch_args = make_mega_moe_launch_options(num_blocks, 256),
     };
     const auto code =
         SM100MegaMoEBackwardCombineRuntime::generate(args);
@@ -993,13 +1037,43 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
     const bool& synchronize_after_dispatch,
     const bool& barrier_only,
     const bool& x_prepared,
-    const int& route_prelude_threads) {
+    const int& route_prelude_threads,
+    const bool& skip_unweighted_padding = false,
+    const std::optional<torch::Tensor>& dy_block_ready = std::nullopt,
+    const std::optional<int>& num_sms_opt = std::nullopt) {
     const auto [num_pool_rows, hidden] =
         get_shape<2>(grad_y_unweighted_output);
     const int num_experts =
         static_cast<int>(expert_counts.numel());
     const int num_ranks =
         static_cast<int>(backward_sym_buffer_ptrs.size());
+    // Kimi-only restrictions apply to the opt-in producer, not the original
+    // serial prelude (which also supports H=2048 and fixed-top-k routing).
+    if (skip_unweighted_padding || dy_block_ready.has_value()) {
+        DG_HOST_ASSERT(hidden == 3584 &&
+            ((num_experts == 112 && num_ranks == 8) ||
+             (((num_experts == 150 || num_experts == 22) && num_ranks == 6) || (num_experts == 64 && num_ranks == 2))));
+        DG_HOST_ASSERT((((num_experts == 22 || num_experts == 64) && num_topk == 8) || ((num_experts != 22 && num_experts != 64) && num_topk == 16)) && (block_m == 240 || (num_ranks == 8 && block_m == 192)));
+        DG_HOST_ASSERT(route_prelude_threads == 256);
+        DG_HOST_ASSERT(combine_order_mode != "fixed_topk");
+    }
+    const int num_dy_ready_states = num_experts * (3584 / 64) * (3072 / 128);
+    // Explicit private probe only; default calls retain the old padding stores.
+    DG_HOST_ASSERT(!skip_unweighted_padding ||
+        (combine_order_mode == "deepep" && do_reverse_dispatch &&
+         compute_route_dot && write_weighted && !synchronize_ranks &&
+         (!synchronize_after_dispatch || dy_block_ready.has_value()) &&
+         !barrier_only && x_prepared));
+    if (dy_block_ready.has_value()) {
+        DG_HOST_ASSERT(route_prelude_threads == 256);
+        DG_HOST_ASSERT(skip_unweighted_padding && synchronize_after_dispatch);
+        DG_HOST_ASSERT(dy_block_ready->is_cuda() && dy_block_ready->is_contiguous());
+        DG_HOST_ASSERT(dy_block_ready->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(dy_block_ready->device() == expert_counts.device());
+        DG_HOST_ASSERT(dy_block_ready->numel() >= num_dy_ready_states);
+        DG_HOST_ASSERT((static_cast<int64_t>(num_pool_rows) + block_m - 1) / block_m <=
+                       num_experts * (3584 / 64) * (3072 / 128));
+    }
     DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
     DG_HOST_ASSERT(
         combine_order_mode == "fixed_topk" ||
@@ -1129,7 +1203,7 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
         }
     }
 
-    const int num_sms = get_mega_moe_num_sms();
+    const int num_sms = resolve_mega_moe_num_sms(num_sms_opt);
     const auto backward_sym_buffer = layout::SymBuffer<>(
         backward_sym_buffer_ptrs, backward_rank);
     const auto backward_workspace = layout::Workspace(
@@ -1158,6 +1232,9 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
             .x_prepared = x_prepared,
             .route_prelude_threads =
                 route_prelude_threads,
+            .skip_unweighted_padding = skip_unweighted_padding,
+            .dy_block_ready = dy_block_ready.has_value()
+                ? reinterpret_cast<uint32_t*>(dy_block_ready->data_ptr<int>()) : nullptr,
             .expert_counts = expert_counts.data_ptr<int>(),
             .backward_workspace = backward_workspace,
             .backward_sym_buffer = backward_sym_buffer,
@@ -1206,17 +1283,17 @@ static void sm100_bf16_mega_moe_backward_post_down_prelude(
             .grad_route_output =
                 grad_route_output.data_ptr<float>(),
             .launch_args =
-                make_mega_moe_launch_options(num_sms, 1024, 4096),
+                make_mega_moe_launch_options(num_sms, dy_block_ready.has_value() ? 512 : 1024, 4096),
         };
     const auto code =
         SM100BF16MegaMoEBackwardPostDownPreludeRuntime::
             generate(args);
     const auto runtime = jit->compile(std::format(
-        "sm100_bf16_mega_moe_backward_prelude_r{}_d{}_w{}_s{}_c{}_b{}_x{}_t{}",
+        "sm100_bf16_mega_moe_backward_prelude_r{}_d{}_w{}_s{}_c{}_b{}_x{}_t{}_p{}_ready{}",
         do_reverse_dispatch, compute_route_dot,
         write_weighted, synchronize_ranks,
         synchronize_after_dispatch, barrier_only,
-        x_prepared, route_prelude_threads), code);
+        x_prepared, route_prelude_threads, skip_unweighted_padding, dy_block_ready.has_value()), code);
     SM100BF16MegaMoEBackwardPostDownPreludeRuntime::launch(
         runtime, args);
 }
@@ -1258,7 +1335,14 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const int& num_topk,
     const std::string& memory_mode,
     const std::optional<torch::Tensor>& kernel_trace =
-        std::nullopt) {
+        std::nullopt,
+    const float situ_beta = 4.0f,
+    const float situ_linear_beta = std::numeric_limits<float>::infinity(),
+    const std::optional<torch::Tensor>& w3_weights = std::nullopt,
+    const bool vectorized_grad_x_store = true,
+    const bool wide_grad_x_store = false,
+    const bool pipeline_dy = false, const int backward_phase = 0,
+    const std::optional<int>& num_sms_opt = std::nullopt) {
     constexpr int block_n = 128;
     constexpr int block_k = 128;
     constexpr int dgrad_block_k = 64;
@@ -1267,21 +1351,57 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     constexpr int num_epilogue_stages = 2;
     constexpr int num_tma_store_stages = 2;
 
-    const auto [num_experts, intermediate_hidden_2, hidden] =
+    const auto [num_experts, weight_rows, hidden] =
         get_shape<3>(w13_weights);
     const auto [num_experts_w2, hidden_w2, intermediate_hidden] =
         get_shape<3>(w2_weights);
+    const int intermediate_hidden_2 = 2 * intermediate_hidden;
     const int num_pool_rows = static_cast<int>(grad_ye.size(0));
     const int num_ranks =
         static_cast<int>(backward_sym_buffer_ptrs.size());
     const int sf_block_m = align(block_m, 128);
     const int sf_block_n = block_n;
-    const int load_block_m = block_m / 2;
+    const int load_block_m = backward_phase == 4 ? 128 : block_m / 2;
     const int load_block_n = block_n;
     const int num_dispatch_warps = num_ranks > 1 ? 4 : 0;
 
+    const int configured_num_sms = resolve_mega_moe_num_sms(num_sms_opt);
+    DG_HOST_ASSERT(backward_phase == 0 || backward_phase == 1 || backward_phase == 2 || backward_phase == 4);
+    if (backward_phase != 0) {
+        DG_HOST_ASSERT(pipeline_dy && ((num_ranks == 6 && (num_experts == 150 || num_experts == 22)) ||
+                                     (num_ranks == 8 && num_experts == 112) || (num_ranks == 2 && num_experts == 64)));
+        DG_HOST_ASSERT(jit->device.get_arch_minor() == 3 &&
+                       (configured_num_sms == 148 || configured_num_sms == 140 || configured_num_sms == 132));
+    }
+    // K3.1 split backward. Inputs and scratch remain exclusively owned
+    // by this invocation until the consumer completes, including graph replay.
+    if (pipeline_dy) {
+        // EP2 is opt-in for the existing W2/W13 split only; compact phase4 stays excluded.
+        DG_HOST_ASSERT(num_ranks != 2 || backward_phase == 1 || backward_phase == 2);
+        DG_HOST_ASSERT(hidden == 3584 && intermediate_hidden == 3072);
+        DG_HOST_ASSERT((num_experts == 112 && num_ranks == 8) ||
+                       (((num_experts == 150 || num_experts == 22) && num_ranks == 6) || (num_experts == 64 && num_ranks == 2)));
+        DG_HOST_ASSERT((((num_experts == 22 || num_experts == 64) && num_topk == 8) || ((num_experts != 22 && num_experts != 64) && num_topk == 16)) && (block_m == 240 || (num_ranks == 8 && block_m == 192)));
+        DG_HOST_ASSERT(activation == "situ" && situ_beta == 4.0f && situ_linear_beta == 25.0f);
+        DG_HOST_ASSERT(route_weight_mode == "post_down" && combine_order_mode == "deepep");
+        DG_HOST_ASSERT(memory_mode == "phase_ordered" && w3_weights.has_value());
+        DG_HOST_ASSERT(direct_remote_grad_x && !write_grad_x_pool && clear_wgrad_padding);
+        DG_HOST_ASSERT(vectorized_grad_x_store && !wide_grad_x_store && !kernel_trace.has_value());
+        DG_HOST_ASSERT(backward_grad_route.has_value());
+        DG_HOST_ASSERT(grid_sync_counter.is_cuda() && expert_counts.is_cuda());
+        DG_HOST_ASSERT(grid_sync_counter.device() == expert_counts.device());
+        DG_HOST_ASSERT((static_cast<int64_t>(num_pool_rows) + block_m - 1) / block_m <=
+                       num_experts * (3584 / 64) * (3072 / 128));
+    }
+
     DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
-    DG_HOST_ASSERT(activation == "swiglu" || activation == "geglu");
+    DG_HOST_ASSERT(activation == "swiglu" || activation == "geglu" || activation == "situ");
+    if (activation == "situ") {
+        DG_HOST_ASSERT(std::isfinite(situ_beta) && situ_beta > 0);
+        DG_HOST_ASSERT(situ_linear_beta > 0);
+        DG_HOST_ASSERT(route_weight_mode == "post_down");
+        DG_HOST_ASSERT(activation_limit == std::numeric_limits<float>::infinity());
+    }
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
@@ -1293,7 +1413,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         backward_rank >= 0 && backward_rank < num_ranks);
     DG_HOST_ASSERT(num_experts == num_experts_w2);
     DG_HOST_ASSERT(hidden == hidden_w2);
-    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(weight_rows == (w3_weights.has_value() ? intermediate_hidden : 2 * intermediate_hidden));
     DG_HOST_ASSERT(block_m % 16 == 0);
     DG_HOST_ASSERT(hidden % 256 == 0);
     DG_HOST_ASSERT(intermediate_hidden % 256 == 0);
@@ -1317,6 +1437,11 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     check_bf16_contiguous(down_unweighted_output);
     check_bf16_contiguous(w2_weights);
     check_bf16_contiguous(w13_weights);
+    if (w3_weights.has_value()) {
+        check_bf16_contiguous(*w3_weights);
+        DG_HOST_ASSERT(w3_weights->sizes() == w13_weights.sizes());
+        DG_HOST_ASSERT(w3_weights->device() == w13_weights.device());
+    }
     check_bf16_contiguous(backward_grad_y);
     check_bf16_contiguous(backward_x);
     DG_HOST_ASSERT(backward_topk_weights.scalar_type() == torch::kFloat);
@@ -1520,9 +1645,12 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         num_experts *
         (intermediate_hidden_2 / dgrad_block_k) *
         (hidden / block_n);
+    // Match the guarded split-BF16 device barrier offset. Phase0 and all
+    // other paths retain the original weight-ready workspace layout.
+    const bool compact_grid_sync = backward_phase == 1 || backward_phase == 2 || backward_phase == 4;
     DG_HOST_ASSERT(
         grid_sync_counter.numel() >=
-        num_w2_states + num_w13_states + 2);
+        num_w2_states + (compact_grid_sync ? 0 : num_w13_states) + 2);
 
     const int smem_cd =
         store_block_m * block_n *
@@ -1531,8 +1659,8 @@ static void sm100_bf16_mega_moe_backward_dgrad(
     const int smem_per_stage =
         load_block_m * block_k +
         load_block_n * block_k +
-        sf_block_m * static_cast<int>(sizeof(uint32_t)) +
-        sf_block_n * static_cast<int>(sizeof(uint32_t)) +
+        (backward_phase == 4 ? 0 :
+            (sf_block_m + sf_block_n) * static_cast<int>(sizeof(uint32_t))) +
         2 * static_cast<int>(sizeof(uint64_t));
     const int smem_fixed =
         num_dispatch_warps * hidden *
@@ -1553,6 +1681,22 @@ static void sm100_bf16_mega_moe_backward_dgrad(
             1024);
     DG_HOST_ASSERT(num_stages >= 2);
 
+    // Give the K3.1 EP8 dgrad epilogue more registers per thread while keeping
+    // the producer and TMEM-loader warps intact. Token counts do not select
+    // the policy, so changing document lengths does not add JIT variants.
+    const int num_threads =
+        jit->device.get_arch_minor() == 3 &&
+        hidden == 3584 && intermediate_hidden == 3072 &&
+        ((num_experts == 112 && num_ranks == 8) ||
+         (((num_experts == 150 || (num_experts == 22 && pipeline_dy)) && num_ranks == 6) || (num_ranks == 2 && num_experts == 64 && pipeline_dy))) &&
+        (((num_experts == 22 || num_experts == 64) && num_topk == 8) || ((num_experts != 22 && num_experts != 64) && num_topk == 16)) &&
+        (block_m == 240 || (pipeline_dy && num_ranks == 8 && block_m == 192)) &&
+        activation == "situ" &&
+        memory_mode == "phase_ordered" && route_weight_mode == "post_down" &&
+        combine_order_mode == "deepep" && w3_weights.has_value() &&
+        direct_remote_grad_x && !write_grad_x_pool && clear_wgrad_padding &&
+        vectorized_grad_x_store && !wide_grad_x_store ? (pipeline_dy ? 640 : 896) : 1024;
+
     // Recompute descriptors are compile-time dead in BF16 mode. Keep valid
     // descriptors in every slot so descriptor prefetch remains well-defined.
     const auto tensor_map_acts = make_tma_2d_desc(
@@ -1561,14 +1705,21 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         static_cast<int>(x_pool_output.stride(-2)), 128);
     const auto tensor_map_w13 = make_tma_2d_desc(
         w13_weights, hidden,
-        num_experts * intermediate_hidden_2,
+        num_experts * weight_rows,
         block_k, load_block_n,
         static_cast<int>(w13_weights.stride(-2)), 128);
     const auto tensor_map_w13_dgrad = make_tma_2d_desc(
         w13_weights, hidden,
-        num_experts * intermediate_hidden_2,
+        num_experts * weight_rows,
         load_block_n, dgrad_block_k,
         static_cast<int>(w13_weights.stride(-2)), 128);
+    // The FP4 weight descriptor is unused in BF16 mode. Reuse that argument
+    // slot for the optional separate up-weight dgrad descriptor.
+    const auto tensor_map_w3_dgrad = w3_weights.has_value()
+        ? make_tma_2d_desc(*w3_weights, hidden, num_experts * intermediate_hidden,
+                           load_block_n, dgrad_block_k,
+                           static_cast<int>(w3_weights->stride(-2)), 128)
+        : tensor_map_w13;
     const auto tensor_map_gate_up = make_tma_2d_desc(
         gate_up_output, intermediate_hidden_2, num_pool_rows,
         block_n, store_block_m,
@@ -1589,7 +1740,9 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         static_cast<int>(
             grad_gate_up_output.stride(-2)), 128);
 
-    const int num_sms = get_mega_moe_num_sms();
+    // Private phase4 budget trial; phase1/2/serial launch budgets stay unchanged.
+    const int num_sms = backward_phase == 4 ? 104 : (backward_phase >= 2 ? 96 : configured_num_sms);
+    DG_HOST_ASSERT(num_sms <= configured_num_sms);
     DG_HOST_ASSERT(num_sms % 2 == 0);
     constexpr int num_trace_sites = 22;
     constexpr int num_trace_values = 5;
@@ -1620,6 +1773,12 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         num_max_tokens_per_rank, num_topk,
         layout::kMinCandidateBlockM);
 
+    auto launch_options = make_mega_moe_launch_options(num_sms, num_threads, smem_size, 2);
+    launch_options.enable_pdl = pipeline_dy && backward_phase < 2;
+    if (pipeline_dy) {
+        DG_HOST_ASSERT((backward_phase >= 2 ? num_sms == (backward_phase == 4 ? 104 : 96) : (num_sms == 148 || (backward_phase == 1 && (num_sms == 140 || num_sms == 132)))) && num_threads == 640 &&
+                       num_w2_states == num_experts * (3584 / 64) * (3072 / 128));
+    }
     const SM100FP8FP4MegaMoEBackwardWaveRuntime::Args args = {
         .hidden = hidden,
         .intermediate_hidden = intermediate_hidden,
@@ -1636,7 +1795,10 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .num_sms = num_sms,
         .num_ranks = num_ranks,
         .bf16_mode = true,
+        .separate_w13 = w3_weights.has_value(),
         .activation = activation,
+        .situ_beta = situ_beta,
+        .situ_linear_beta = situ_linear_beta,
         .fast_math = fast_math,
         .route_weight_mode = route_weight_mode,
         .combine_order_mode = combine_order_mode,
@@ -1671,7 +1833,7 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .tensor_map_w2_weights = tensor_map_w2,
         .tensor_map_w2_scales = tensor_map_w2,
         .tensor_map_w13_dequant = tensor_map_w13_dgrad,
-        .tensor_map_w13_weights = tensor_map_w13,
+        .tensor_map_w13_weights = tensor_map_w3_dgrad,
         .tensor_map_w13_scales = tensor_map_w13,
         .tensor_map_grad_gate_up =
             tensor_map_grad_gate_up,
@@ -1735,12 +1897,8 @@ static void sm100_bf16_mega_moe_backward_dgrad(
         .clear_wgrad_padding = clear_wgrad_padding,
         .compute_route_grad = true,
         .trace_kernel = kernel_trace.has_value(),
-        .vectorized_grad_x_store = deep_jit::get_env<int>(
-            "DG_BF16_MEGA_MOE_VECTORIZED_GRAD_X_STORE",
-            1) == 1,
-        .wide_grad_x_store = deep_jit::get_env<int>(
-            "DG_BF16_MEGA_MOE_WIDE_GRAD_X_STORE",
-            0) == 1,
+        .vectorized_grad_x_store = vectorized_grad_x_store,
+        .wide_grad_x_store = wide_grad_x_store,
         .kernel_trace =
             kernel_trace.has_value()
             ? reinterpret_cast<uint64_t*>(
@@ -1751,18 +1909,52 @@ static void sm100_bf16_mega_moe_backward_dgrad(
             route_weight_mode == "post_down",
         .dispatch_inputs_prepared =
             memory_mode == "phase_ordered",
-        .launch_args =
-            make_mega_moe_launch_options(num_sms, 1024, smem_size, 2),
+        .consume_dy_blocks = pipeline_dy,
+        .backward_phase = backward_phase,
+        .launch_args = launch_options,
     };
     const auto code =
         SM100FP8FP4MegaMoEBackwardWaveRuntime::generate(args);
     const auto runtime = jit->compile(
         std::format(
-            "sm100_bf16_mega_moe_backward_dgrad_trace{}_vec{}_wide{}",
+            "sm100_bf16_mega_moe_backward_dgrad_trace{}_vec{}_wide{}_ready{}_phase{}",
             kernel_trace.has_value(),
             args.vectorized_grad_x_store,
-            args.wide_grad_x_store),
+            args.wide_grad_x_store, pipeline_dy, backward_phase),
         code);
+    if (pipeline_dy && backward_phase < 2) {
+        // Reset is a device operation on every invocation/replay, never a host epoch.
+        const auto prepare_code = std::format(R"(
+#include <deep_gemm/impls/sm100_bf16_dy_pipeline_prepare.cuh>
+using namespace deep_gemm;
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(
+        &sm100_bf16_dy_pipeline_prepare<{}, {}, {}, {}, {}>);
+}};
+)", hidden, num_experts, block_m, num_sms, num_w2_states);
+        const auto prepare_kernel = jit->compile("sm100_bf16_dy_pipeline_prepare", prepare_code);
+        // Retain source-dY publication before any rank starts gathering.
+        sm100_bf16_mega_moe_backward_post_down_prelude(
+            grad_y_unweighted_output, grad_ye, x_pool_output, route_weights,
+            grad_route_output, down_unweighted_output, expert_counts,
+            backward_grad_y, backward_x, backward_topk_weights, backward_grad_route,
+            token_src_metadata, backward_sym_buffer_ptrs, backward_rank,
+            num_topk, block_m, combine_order_mode,
+            false, false, false, true, false, true, true, 256, false, std::nullopt, configured_num_sms);
+        jit->launch(prepare_kernel, make_mega_moe_launch_options(num_sms, 256),
+            expert_counts.data_ptr<int>(), static_cast<uint32_t>(num_pool_rows),
+            args.grad_ye_output, route_weights.data_ptr<float>(),
+            grad_route_output.data_ptr<float>(), args.grid_sync_counter);
+        // The producer owns peer-reader retirement. Nothing is enqueued between
+        // it and the dependent consumer; both use the current CUDA stream.
+        sm100_bf16_mega_moe_backward_post_down_prelude(
+            grad_y_unweighted_output, grad_ye, x_pool_output, route_weights,
+            grad_route_output, down_unweighted_output, expert_counts,
+            backward_grad_y, backward_x, backward_topk_weights, backward_grad_route,
+            token_src_metadata, backward_sym_buffer_ptrs, backward_rank,
+            num_topk, block_m, combine_order_mode,
+            true, true, true, false, true, false, true, 256, true, grid_sync_counter, configured_num_sms);
+    }
     SM100FP8FP4MegaMoEBackwardWaveRuntime::launch(
         runtime, args);
 }

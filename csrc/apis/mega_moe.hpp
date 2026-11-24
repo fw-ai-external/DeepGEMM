@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+#include <limits>
 #include <functional>
 #include <string>
 #include <pybind11/functional.h>
@@ -49,11 +51,12 @@ static int get_block_m_for_mega_moe(
 static int get_num_ring_tokens_for_mega_moe(
     const int num_ranks, const int num_experts,
     const int num_max_tokens_per_rank, const int num_topk,
-    const int hidden, const int intermediate_hidden) {
+    const int hidden, const int intermediate_hidden,
+    const std::optional<int>& num_sms_opt = std::nullopt) {
     DG_HOST_ASSERT(num_ranks > 0 && num_experts > 0 && num_experts % num_ranks == 0);
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
     // TODO: we temporarily assume the SM count is consistent with the runtime value
-    const auto num_sms = get_mega_moe_num_sms();
+    const auto num_sms = resolve_mega_moe_num_sms(num_sms_opt);
     const auto num_experts_per_rank = num_experts / num_ranks;
     const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
     const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
@@ -73,13 +76,15 @@ static int get_num_ring_tokens_for_mega_moe(
 static std::tuple<
     int64_t,
     std::function<MegaMoESharedSlices(const torch::Tensor&)>>
-get_symm_buffer_size_for_mega_moe_v3(
+get_symm_buffer_size_for_mega_moe_impl(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const std::string& mma_type, const std::string& activation,
     const int& requested_num_ring_tokens,
-    const int& num_shared_experts = 0) {
+    const int& num_shared_experts,
+    const bool bounded_lag,
+    const std::optional<int>& num_sms_opt = std::nullopt) {
     DG_HOST_ASSERT(num_ranks > 0 and num_experts > 0 and num_topk > 0);
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu" or activation == "situ");
@@ -87,13 +92,26 @@ get_symm_buffer_size_for_mega_moe_v3(
 
     const auto num_experts_per_rank = num_experts / num_ranks;
     const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
-    int num_ring_tokens = get_num_ring_tokens_for_mega_moe(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden);
+    DG_HOST_ASSERT(!bounded_lag || mma_type == "bf16xbf16");
+    int num_ring_tokens = 0;
+    if (bounded_lag) {
+        const auto lag = sched::get_bounded_lag_units(num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+        const auto ring_blocks = sched::get_bounded_lag_ring_blocks(lag);
+        const auto routed_rows = num_max_tokens_per_rank * num_ranks * std::min(num_topk, num_experts_per_rank);
+        for (const auto block_m : layout::kCandidateBlockM) {
+            const auto full_blocks = ceil_div(routed_rows, block_m) + num_experts_per_rank;
+            num_ring_tokens = std::max(num_ring_tokens, std::min(full_blocks, static_cast<int>(ring_blocks)) * block_m);
+        }
+        num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
+    } else {
+        num_ring_tokens = get_num_ring_tokens_for_mega_moe(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden, num_sms_opt);
+    }
     DG_HOST_ASSERT(requested_num_ring_tokens >= 0);
     if (requested_num_ring_tokens > 0) {
         DG_HOST_ASSERT(requested_num_ring_tokens % layout::kLCMCandidateBlockM == 0);
         DG_HOST_ASSERT(requested_num_ring_tokens >= num_ring_tokens and
-                       "Explicit ring capacity is too small for the upstream scheduler");
+                       "Explicit ring capacity is too small for the selected scheduler");
         num_ring_tokens = requested_num_ring_tokens;
     }
 
@@ -226,6 +244,33 @@ get_symm_buffer_size_for_mega_moe_v3(
                                shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf);
     };
     return {reinterpret_cast<int64_t>(backward_route_grad_buffer.get_end_ptr()), slice_input_buffers};
+}
+
+// Preserve the existing raw pybind sizing ABI; bounded lag is explicitly opt-in.
+static auto get_symm_buffer_size_for_mega_moe_v3(
+    const int& num_ranks, const int& num_experts,
+    const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const std::string& mma_type, const std::string& activation,
+    const int& requested_num_ring_tokens, const int& num_shared_experts = 0,
+    const std::optional<int>& num_sms_opt = std::nullopt) {
+    return get_symm_buffer_size_for_mega_moe_impl(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, mma_type, activation,
+        requested_num_ring_tokens, num_shared_experts, false, num_sms_opt);
+}
+
+static auto get_symm_buffer_size_for_bf16_mega_moe_bounded_lag(
+    const int& num_ranks, const int& num_experts,
+    const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const std::string& mma_type, const std::string& activation,
+    const int& requested_num_ring_tokens, const int& num_shared_experts,
+    const std::optional<int>& num_sms_opt = std::nullopt) {
+    return get_symm_buffer_size_for_mega_moe_impl(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, mma_type, activation,
+        requested_num_ring_tokens, num_shared_experts, true, num_sms_opt);
 }
 
 static std::tuple<int64_t, std::function<MegaMoEExpandedSlices(const torch::Tensor&)>>
@@ -543,11 +588,14 @@ static void bf16_mega_moe(
     const std::optional<torch::Tensor>& route_count_mismatch,
     const std::optional<torch::Tensor>& saved_x,
     const std::optional<torch::Tensor>& shared_l1_weights_opt,
-    const std::optional<torch::Tensor>& shared_l2_weights_opt
-) {
+    const std::optional<torch::Tensor>& shared_l2_weights_opt,
+    const float situ_beta, const float situ_linear_beta,
+    const std::optional<torch::Tensor>& l1_up_weights,
+    const bool bounded_lag,
+    const std::optional<int>& num_sms_opt = std::nullopt) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
-    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu" or activation == "situ");
     DG_HOST_ASSERT(
         route_weight_mode == "pre_down" ||
         route_weight_mode == "post_down");
@@ -557,6 +605,15 @@ static void bf16_mega_moe(
         combine_order_mode == "deepep_v1");
 
     DG_HOST_ASSERT(shared_l1_weights_opt.has_value() == shared_l2_weights_opt.has_value());
+
+    if (activation == "situ") {
+        DG_HOST_ASSERT(std::isfinite(situ_beta) && situ_beta > 0);
+        DG_HOST_ASSERT(situ_linear_beta > 0);
+        DG_HOST_ASSERT(route_weight_mode == "post_down");
+        DG_HOST_ASSERT(!activation_clamp_opt.has_value() || std::isinf(*activation_clamp_opt));
+        DG_HOST_ASSERT(!fast_math);
+        DG_HOST_ASSERT(!shared_l1_weights_opt.has_value());
+    }
 
     // Activation checks
     const auto activation_clamp =
@@ -578,7 +635,15 @@ static void bf16_mega_moe(
     DG_HOST_ASSERT(num_config_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
-    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(intermediate_hidden_2 == (l1_up_weights.has_value() ? 1 : 2) * intermediate_hidden);
+    if (l1_up_weights.has_value()) {
+        DG_HOST_ASSERT(!shared_l1_weights_opt.has_value());
+        DG_HOST_ASSERT(l1_weights.dim() == 3 && l2_weights.dim() == 3);
+        DG_HOST_ASSERT(l1_up_weights->sizes() == l1_weights.sizes());
+        DG_HOST_ASSERT(l1_up_weights->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(l1_up_weights->is_contiguous());
+        DG_HOST_ASSERT(l1_up_weights->device() == l1_weights.device());
+    }
 
     int num_shared_experts = 0, shared_intermediate_hidden = 0;
     torch::Tensor shared_l1_weights, shared_l2_weights;
@@ -636,11 +701,11 @@ static void bf16_mega_moe(
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
     const auto [expanded_num_required_bytes, slice] =
-        get_symm_buffer_size_for_mega_moe_v3(
+        get_symm_buffer_size_for_mega_moe_impl(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        "bf16xbf16", activation, num_ring_tokens, num_shared_experts);
+        "bf16xbf16", activation, num_ring_tokens, num_shared_experts, bounded_lag, num_sms_opt);
     const auto num_required_bytes =
         expanded_num_required_bytes -
         static_cast<int64_t>(num_max_tokens_per_rank) *
@@ -679,7 +744,7 @@ static void bf16_mega_moe(
                             precomputed_route_counts,
                             active_pool_rows,
                             route_count_mismatch,
-                            saved_x);
+                            saved_x, situ_beta, situ_linear_beta, l1_up_weights, bounded_lag, num_sms_opt);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -1006,9 +1071,26 @@ static void bf16_mega_moe_side_lora(
 
 
 static void register_apis(pybind11::module_& m) {
+    m.attr("BF16_MEGAMOE_SITU") = true;
+    m.attr("BF16_MEGAMOE_SITU_FAST_BACKWARD") = true;
+    m.attr("BF16_MEGAMOE_SITU_PRECISE_PIPELINE") = true;
+    m.attr("BF16_MEGAMOE_SEPARATE_W13") = true;
+    m.attr("BF16_MEGAMOE_SPLIT_BACKWARD") = true;
+    m.attr("BF16_MEGAMOE_COMPACT_SPLIT_BACKWARD") = true;
+    m.attr("BF16_MEGAMOE_KIMI_SHRINK_EP2_SPLIT") = true;
+    m.attr("BF16_MEGAMOE_KIMI_SHRINK_EP6") = true;
+    m.attr("BF16_MEGAMOE_SCOPED_SM_BUDGET") = true;
+    m.attr("BF16_MEGAMOE_SEPARATE_L1") = true;
     m.def("bf16_mega_moe_side_lora", &bf16_mega_moe_side_lora);
     m.def("get_symm_buffer_size_for_mega_moe_side_lora", &get_symm_buffer_size_for_mega_moe_side_lora);
-    m.def("get_num_ring_tokens_for_mega_moe", &get_num_ring_tokens_for_mega_moe);
+    m.def("get_num_ring_tokens_for_mega_moe", &get_num_ring_tokens_for_mega_moe,
+        py::arg("num_ranks"),
+        py::arg("num_experts"),
+        py::arg("num_max_tokens_per_rank"),
+        py::arg("num_topk"),
+        py::arg("hidden"),
+        py::arg("intermediate_hidden"),
+        py::arg("num_sms") = py::none());
     m.def(
         "fp8_fp4_mega_moe_side_lora",
         &fp8_fp4_mega_moe_side_lora,
@@ -1031,7 +1113,30 @@ static void register_apis(pybind11::module_& m) {
         py::arg("side_lora_l2_scratch"), py::arg("side_lora_ready"),
         py::arg("side_lora_scale"));
 
-    m.def("get_symm_buffer_size_for_mega_moe_v3", &get_symm_buffer_size_for_mega_moe_v3);
+    m.def("get_symm_buffer_size_for_mega_moe_v3", &get_symm_buffer_size_for_mega_moe_v3,
+        py::arg("num_ranks"),
+        py::arg("num_experts"),
+        py::arg("num_max_tokens_per_rank"),
+        py::arg("num_topk"),
+        py::arg("hidden"),
+        py::arg("intermediate_hidden"),
+        py::arg("mma_type"),
+        py::arg("activation"),
+        py::arg("requested_num_ring_tokens"),
+        py::arg("num_shared_experts"),
+        py::arg("num_sms") = py::none());
+    m.def("get_symm_buffer_size_for_bf16_mega_moe_bounded_lag", &get_symm_buffer_size_for_bf16_mega_moe_bounded_lag,
+        py::arg("num_ranks"),
+        py::arg("num_experts"),
+        py::arg("num_max_tokens_per_rank"),
+        py::arg("num_topk"),
+        py::arg("hidden"),
+        py::arg("intermediate_hidden"),
+        py::arg("mma_type"),
+        py::arg("activation"),
+        py::arg("requested_num_ring_tokens"),
+        py::arg("num_shared_experts"),
+        py::arg("num_sms") = py::none());
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
@@ -1091,7 +1196,12 @@ static void register_apis(pybind11::module_& m) {
         py::arg("route_count_mismatch"),
         py::arg("saved_x"),
         py::arg("shared_l1_weights_opt") = py::none(),
-        py::arg("shared_l2_weights_opt") = py::none());
+        py::arg("shared_l2_weights_opt") = py::none(),
+        py::arg("situ_beta") = 4.0f,
+        py::arg("situ_linear_beta") = std::numeric_limits<float>::infinity(),
+        py::arg("l1_up_weights") = py::none(),
+        py::arg("bounded_lag") = false,
+        py::arg("num_sms") = py::none());
 }
 
 } // namespace deep_gemm::mega

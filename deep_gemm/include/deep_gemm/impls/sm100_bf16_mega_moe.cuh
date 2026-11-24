@@ -41,6 +41,11 @@ template <
     CombineOrderMode kCombineOrderMode,
     bool kSaveDownUnweighted,
     bool kSaveX,
+    float kSituBeta = 4.0f,
+    float kSituLinearBeta = cute::numeric_limits<float>::infinity(),
+    bool kSeparateL1 = false,
+    bool kUseLocalityDomains = true,
+    uint32_t kL2LagUnits = 0,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -85,9 +90,11 @@ sm100_bf16_mega_moe_impl(void* y,
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
 
-    // Use one domain when clusters cannot split evenly across device locality domains
+    // Per-domain warmup assumes balanced scheduler counts. A partial grid may
+    // place unequal numbers of clusters in the two domains, so use one queue
+    // when the host reserves SMs for concurrent communication.
     constexpr uint32_t kNumLocalityDomains =
-        L1_SHAPE_N % (BLOCK_N * 2 * kNumDeviceLocalityDomains) == 0 and
+        kUseLocalityDomains and L1_SHAPE_N % (BLOCK_N * 2 * kNumDeviceLocalityDomains) == 0 and
         L2_SHAPE_N % (BLOCK_N * 2 * kNumDeviceLocalityDomains) == 0 ? kNumDeviceLocalityDomains : 1;
 
     // Template checks
@@ -95,6 +102,15 @@ sm100_bf16_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+
+    if constexpr (kL2LagUnits > 0) {
+        constexpr uint32_t max_rows = kNumMaxTokensPerRank * kNumRanks *
+            (kNumTopk < kNumExpertsPerRank ? kNumTopk : kNumExpertsPerRank);
+        constexpr uint32_t max_blocks = math::constexpr_ceil_div(max_rows, BLOCK_M) + kNumExpertsPerRank;
+        constexpr uint32_t lag_blocks = sched::get_bounded_lag_ring_blocks(kL2LagUnits);
+        DG_STATIC_ASSERT(kNumRingBlocks >= (max_blocks < lag_blocks ? max_blocks : lag_blocks),
+                         "Ring capacity is too small for bounded lag");
+    }
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -181,7 +197,10 @@ sm100_bf16_mega_moe_impl(void* y,
     // Assign shared memory
     struct SharedStorage {
         alignas(kSharedMemoryAlignment) uint32_t expert_token_count[kNumExperts];
-        alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps][kNumBytesPerPull];
+        union {
+            alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps][kNumBytesPerPull];
+            alignas(kSharedMemoryAlignment) uint32_t stable_counter_scratch[kNumDispatchWarps][kNumExperts];
+        };
         union {
             alignas(kSharedMemoryAlignment) d_dtype_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M * L1_OUT_BLOCK_N];
             alignas(kSharedMemoryAlignment) d_dtype_t l2[kNumEpilogueWarpgroups][STORE_BLOCK_M * BLOCK_N];
@@ -270,7 +289,9 @@ sm100_bf16_mega_moe_impl(void* y,
         kNumExpertsPerRank,
         kNumSMs, kNumRanks,
         kNumRingBlocks, kNumLocalityDomains,
-        kNumSharedExperts>(
+        kNumSharedExperts, math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
+        L1_SHAPE_N / BLOCK_N, L2_SHAPE_N / BLOCK_N,
+        L1_SHAPE_N / (BLOCK_N * 2), L2_SHAPE_N / (BLOCK_N * 2), kL2LagUnits>(
             workspace,
             shared_storage.task_info_full_barriers,
             shared_storage.task_info_empty_barriers,
@@ -385,14 +406,13 @@ sm100_bf16_mega_moe_impl(void* y,
                     warp_expert_prefix +
                     global_warp_idx * kNumExperts;
 
-                DG_STATIC_ASSERT(
-                    kNumBytesPerPull >=
-                        kNumExperts * sizeof(uint32_t),
-                    "Dispatch scratch is too small for stable counters");
+                // Keep the old counter placement where it fits, including
+                // EP8 K3.1, and use the wider union member for padded EP6.
                 auto local_expert_count =
-                    reinterpret_cast<uint32_t*>(
-                        shared_storage
-                            .dispatch_send_buffer[warp_idx]);
+                    kNumExperts * sizeof(uint32_t) <= kNumBytesPerPull
+                        ? reinterpret_cast<uint32_t*>(
+                              shared_storage.dispatch_send_buffer[warp_idx])
+                        : shared_storage.stable_counter_scratch[warp_idx];
                 for (uint32_t expert_idx = lane_idx;
                      expert_idx < kNumExperts;
                      expert_idx += kWarpSize) {
@@ -433,20 +453,24 @@ sm100_bf16_mega_moe_impl(void* y,
                             kDispatchBarrierIdx);
                     });
 
-                if (
-                    global_warp_idx < kNumExperts &&
-                    lane_idx == 0) {
-                    uint32_t prefix = 0;
-                    for (uint32_t source_warp = 0;
-                         source_warp < kNumGlobalWarps;
-                         ++source_warp) {
-                        auto count_ptr =
-                            warp_expert_prefix +
-                            source_warp * kNumExperts +
-                            global_warp_idx;
-                        const uint32_t count = *count_ptr;
-                        *count_ptr = prefix;
-                        prefix += count;
+                if (lane_idx == 0) {
+                    // Experts can outnumber dispatch warps (e.g. 896 experts
+                    // on 148 SMs). Convert every histogram column to prefixes.
+                    for (uint32_t target_expert = global_warp_idx;
+                         target_expert < kNumExperts;
+                         target_expert += kNumGlobalWarps) {
+                        uint32_t prefix = 0;
+                        for (uint32_t source_warp = 0;
+                             source_warp < kNumGlobalWarps;
+                             ++source_warp) {
+                            auto count_ptr =
+                                warp_expert_prefix +
+                                source_warp * kNumExperts +
+                                target_expert;
+                            const uint32_t count = *count_ptr;
+                            *count_ptr = prefix;
+                            prefix += count;
+                        }
                     }
                 }
 
@@ -1055,8 +1079,40 @@ sm100_bf16_mega_moe_impl(void* y,
 
                 // TMA copy weights
                 if (cute::elect_one_sync()) {
-                    tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
-                        tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
+                    if (kSeparateL1 && task_info.block_phase == sched::BlockPhase::Linear1) {
+                        // Recreate the existing eight-row gate/up interleave
+                        // directly in SMEM. K atoms keep their original stride
+                        // across the full N tile, so MMA and its epilogue see
+                        // exactly the packed layout and accumulation order.
+                        static_assert(LOAD_BLOCK_N % 16 == 0);
+                        constexpr uint32_t kAtomK =
+                            tma::get_inner_block_atom_size<BLOCK_K, kSwizzleBMode, 1, b_dtype_t>();
+                        #pragma unroll
+                        for (uint32_t atom = 0; atom < BLOCK_K / kAtomK; ++atom) {
+                            #pragma unroll
+                            for (uint32_t row = 0; row < LOAD_BLOCK_N; row += 16) {
+                                const uint32_t source_row = (n_idx + row) / 2;
+                                const uint32_t source_half = source_row >= kIntermediateHidden / 2;
+                                const uint32_t source_half_row =
+                                    source_row - source_half * (kIntermediateHidden / 2);
+                                auto* dst = shared_storage.smem_b[stage_idx] +
+                                    atom * LOAD_BLOCK_N * kAtomK + row * kAtomK;
+                                tma::copy_nd<kAtomK, 8, kSwizzleBMode, b_dtype_t, 4>(
+                                    &tensor_map_l1_weights, &shared_storage.full_barriers[stage_idx],
+                                    dst, 2, k_idx + atom * kAtomK,
+                                    source_half_row, source_half, expert_idx);
+                                // Separate routed weights require no fused
+                                // shared expert; borrow its unused descriptor.
+                                tma::copy_nd<kAtomK, 8, kSwizzleBMode, b_dtype_t, 4>(
+                                    &tensor_map_shared_l1_weights, &shared_storage.full_barriers[stage_idx],
+                                    dst + 8 * kAtomK, 2, k_idx + atom * kAtomK,
+                                    source_half_row, source_half, expert_idx);
+                            }
+                        }
+                    } else {
+                        tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
+                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
+                    }
                     if (is_leader_cta) {
                         shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(shared_storage.smem_b[0]) * 2);
                     } else {
@@ -1358,7 +1414,7 @@ sm100_bf16_mega_moe_impl(void* y,
                             }
 
                             const auto gate = __bfloat1622float2(bf16_gate);
-                            const auto up = __bfloat1622float2(bf16_up);
+                            auto up = __bfloat1622float2(bf16_up);
                             float2 z;
                             if constexpr (kActivationType == ActivationType::GeGLU) {
                                 constexpr float kAlpha = 1.5957691216057308f;
@@ -1406,6 +1462,19 @@ sm100_bf16_mega_moe_impl(void* y,
                                         1.0f / denom.y};
                                     activated =
                                         __fmul2_rn(gate, sig);
+                                }
+                            }
+                            if constexpr (kActivationType == ActivationType::SiTU) {
+                                // Match Kimi's separately rounded FP32 sigmoid,
+                                // beta*tanh(gate/beta), and final BF16 product.
+                                const float2 sig = {1.0f / denom.x, 1.0f / denom.y};
+                                activated = __fmul2_rn(
+                                    __fmul2_rn({kSituBeta, kSituBeta},
+                                        {tanhf(gate.x / kSituBeta), tanhf(gate.y / kSituBeta)}),
+                                    sig);
+                                if constexpr (kSituLinearBeta != cute::numeric_limits<float>::infinity()) {
+                                    up = __fmul2_rn({kSituLinearBeta, kSituLinearBeta},
+                                        {tanhf(up.x / kSituLinearBeta), tanhf(up.y / kSituLinearBeta)});
                                 }
                             }
                             // Standard FireTitan grouped experts materialize

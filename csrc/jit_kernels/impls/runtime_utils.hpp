@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <format>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -78,6 +79,18 @@ static int get_mega_moe_num_sms() {
 
     const int num_sms = num_device_sms - headroom;
     DG_HOST_ASSERT(num_sms % 2 == 0);
+    return num_sms;
+}
+
+// An explicit per-call budget does not read or mutate legacy process settings.
+// Validate against the physical device, not the mutable global GEMM limit.
+static int resolve_mega_moe_num_sms(const std::optional<int>& requested) {
+    if (!requested.has_value())
+        return get_mega_moe_num_sms();
+    const int num_sms = *requested;
+    DG_HOST_ASSERT(num_sms > 0 && num_sms % 2 == 0 &&
+                   num_sms <= jit->device.get_num_sms() &&
+                   "Explicit MegaMoE num_sms must be positive, even and device-bounded");
     return num_sms;
 }
 

@@ -13,7 +13,7 @@ struct SideLoraWorkspace : Workspace {
     using Workspace::Workspace;
 
     CUTLASS_DEVICE uint32_t* get_l2_full_count_ptr(const uint32_t ring_block_idx) const {
-        return reinterpret_cast<uint32_t*>(&signals->l2_full_mask[ring_block_idx]);
+        return reinterpret_cast<uint32_t*>(get_l2_full_mask_ptr(ring_block_idx));
     }
 };
 

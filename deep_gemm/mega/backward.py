@@ -1,4 +1,3 @@
-import os
 import time
 from typing import Any, Callable, NamedTuple, Optional, Tuple
 
@@ -6,7 +5,7 @@ import torch
 import torch.distributed as dist
 
 from .. import _C
-from . import CombineOrderMode, RouteWeightMode
+from . import CombineOrderMode, RouteWeightMode, _situ_kwargs, _scoped_num_sms_kwargs
 
 _BF16_BACKWARD_TIMING_HOOK: Optional[Callable[[str, torch.cuda.Event, torch.cuda.Event, float], None]] = None
 _BF16_BACKWARD_KERNEL_TRACE_HOOK: Optional[
@@ -47,8 +46,6 @@ _BF16_BACKWARD_KERNEL_TRACE_FIELDS = (
     "sm_id",
 )
 _BF16_BACKWARD_DECOMPOSE_PRELUDE = False
-_BF16_BACKWARD_SPLIT_BARRIER_FUSED_ROUTE = os.getenv("DG_BF16_SPLIT_BARRIER_FUSED_ROUTE", "1") == "1"
-_BF16_ROUTE_PRELUDE_THREADS = os.getenv("DG_BF16_ROUTE_PRELUDE_THREADS", "128")
 
 
 def _timed_cuda_phase(name: str, operation: Callable[[], Any]) -> Any:
@@ -67,14 +64,14 @@ def _timed_cuda_phase(name: str, operation: Callable[[], Any]) -> Any:
 
 
 def _allocate_backward_kernel_trace(
-    sites: tuple[str, ...], device: torch.device,
+    sites: tuple[str, ...], device: torch.device, num_sms: Optional[int] = None,
 ) -> tuple[torch.Tensor, float]:
     properties = torch.cuda.get_device_properties(device)
     return (
         torch.zeros(
             (
                 len(sites),
-                properties.multi_processor_count,
+                properties.multi_processor_count if num_sms is None else num_sms,
                 len(_BF16_BACKWARD_KERNEL_TRACE_FIELDS),
             ),
             dtype=torch.int64,
@@ -256,6 +253,16 @@ def bf16_mega_moe_backward_dgrad(
     memory_mode: str = "legacy",
     rank_uniform_block_m: bool = False,
     x_prepared: bool = False,
+    situ_beta: float = 4.0,
+    situ_linear_beta: Optional[float] = None,
+    w3_weights: Optional[torch.Tensor] = None,
+    *,
+    split_barrier_fused_route: bool = True,
+    route_prelude_threads: int = 128,
+    vectorized_grad_x_store: bool = True,
+    wide_grad_x_store: bool = False,
+    pipeline_dy: bool = False,
+    backward_phase: int = 0,
 ) -> None:
     """Run BF16 reverse dispatch, dgrad, activation, and direct grad-x.
 
@@ -267,10 +274,47 @@ def bf16_mega_moe_backward_dgrad(
     ``grad_gate_up == gate_up``. Logical tensors whose storage is reused are
     no longer observable after this call. ``"legacy"`` keeps independent
     storage, apart from the historical semantic aliases validated above.
+
+    For SiTU, ``fast_math=True`` uses the hardware tanh approximation in
+    backward only. Sigmoid evaluation, FP32 arithmetic order and BF16
+    materialization are unchanged. The default retains precise tanh.
+
+    Route-prelude scheduling is configured per call. The defaults preserve
+    the split-barrier fused route prelude and the 128-thread H2048 route dot.
+    Other hidden widths retain their 256-thread prelude.
+    Grad-x publication uses vectorized stores by default. Wider stores can be
+    selected explicitly; neither store policy reads process environment state.
     """
+    if backward_phase not in (0, 1, 2, 4) or (backward_phase and not pipeline_dy):
+        raise ValueError("backward_phase must be 0, 1, 2, or 4; split phases require pipeline_dy")
+    if pipeline_dy:
+        if not (x_prepared and rank_uniform_block_m and split_barrier_fused_route
+                and memory_mode == "phase_ordered" and activation == "situ"
+                and situ_beta == 4.0 and situ_linear_beta == 25.0
+                and w3_weights is not None and direct_remote_grad_x
+                and not write_grad_x_pool and clear_wgrad_padding
+                and vectorized_grad_x_store and not wide_grad_x_store
+                and not python_numerical_correction):
+            raise ValueError("pipeline_dy requires the prepared K3.1 BF16 SiTU LoRA path")
+        if _BF16_BACKWARD_DECOMPOSE_PRELUDE or _BF16_BACKWARD_KERNEL_TRACE_HOOK is not None:
+            raise ValueError("pipeline_dy does not support decomposed or instrumented kernels")
+    if route_prelude_threads not in (128, 256):
+        raise ValueError(f"route_prelude_threads must be 128 or 256, got {route_prelude_threads!r}")
+    situ_kwargs = _situ_kwargs(activation, situ_beta, situ_linear_beta,
+                               route_weight_mode, activation_limit, fast_math,
+                               allow_fast_math=bool(getattr(
+                                   _C, "BF16_MEGAMOE_SITU_FAST_BACKWARD", False)))
+    # With a separate up weight, w13_weights is the gate tensor [E, I, H].
+    # Preserve the packed ABI when callers do not request this layout.
+    if w3_weights is not None:
+        if python_numerical_correction:
+            raise ValueError("separate weights do not support Python numerical correction")
+        situ_kwargs["w3_weights"] = w3_weights
+    if activation == "situ" and python_numerical_correction:
+        raise ValueError("SiTU does not support Python numerical correction")
     route_weight_mode = RouteWeightMode(route_weight_mode)
     combine_order_mode = CombineOrderMode(combine_order_mode)
-    if activation not in ("swiglu", "geglu"):
+    if activation not in ("swiglu", "geglu", "situ"):
         raise ValueError(f"unsupported activation: {activation}")
     if not write_grad_x_pool and not direct_remote_grad_x:
         raise ValueError("grad-x requires a local or direct remote output")
@@ -320,282 +364,273 @@ def bf16_mega_moe_backward_dgrad(
             lambda: dist.all_reduce(rank_uniform_block_m, op=dist.ReduceOp.MAX, group=sym_buffer.group),
         )
         block_m = int(_timed_cuda_phase("block_m_host_item", rank_uniform_block_m.item))
-    num_tokens = grad_y.shape[0]
-    backward_grad_y = sym_buffer.backward_grad_y
-    # This dedicated FP32 source plane is backward-only and retains one
-    # scalar per physical top-k slot. Every valid expert row publishes
-    # directly to its unique source slot; invalid routes remain zero.
-    _timed_cuda_phase(
-        "grad_route_plane_clear",
-        sym_buffer.backward_grad_route.zero_,
-    )
-    if direct_remote_grad_x:
-        # Kernel A reuses this region as [topk, token, hidden] direct-write
-        # planes after every rank has pulled grad-y from plane zero. Clear all
-        # planes so masked routes and repeated backward calls reduce as zero.
-        backward_grad_y = torch.as_strided(
-            backward_grad_y,
-            size=(
-                sym_buffer.num_topk,
-                sym_buffer.num_max_tokens_per_rank,
-                sym_buffer.hidden,
-            ),
-            stride=(
-                sym_buffer.num_max_tokens_per_rank * sym_buffer.hidden,
-                sym_buffer.hidden,
-                1,
-            ),
-        )
+    if backward_phase < 2:
+        num_tokens = grad_y.shape[0]
+        backward_grad_y = sym_buffer.backward_grad_y
+        # This dedicated FP32 source plane is backward-only and retains one
+        # scalar per physical top-k slot. Every valid expert row publishes
+        # directly to its unique source slot; invalid routes remain zero.
         _timed_cuda_phase(
-            "grad_y_expose_copy",
-            lambda: backward_grad_y[0, :num_tokens].copy_(grad_y.to(torch.bfloat16).contiguous()),
+            "grad_route_plane_clear",
+            sym_buffer.backward_grad_route.zero_,
         )
-    else:
-        _timed_cuda_phase(
-            "grad_y_expose_copy",
-            lambda: backward_grad_y[:num_tokens].copy_(grad_y.to(torch.bfloat16).contiguous()),
-        )
-    dispatch_inputs_prepared = memory_mode == "phase_ordered"
-    if dispatch_inputs_prepared:
-        # The prelude starts with a device-side NVLink barrier. It publishes
-        # local grad-y before pulling grad-y, x, and route weights with the
-        # full persistent grid. POST_DOWN also performs its exact route dot
-        # and weighted-grad write; PRE_DOWN needs only the input dispatch.
-        prepare_route_and_weighted = route_weight_mode is RouteWeightMode.POST_DOWN
+        if direct_remote_grad_x:
+            # Kernel A reuses this region as [topk, token, hidden] direct-write
+            # planes after every rank has pulled grad-y from plane zero. Clear all
+            # planes so masked routes and repeated backward calls reduce as zero.
+            backward_grad_y = torch.as_strided(
+                backward_grad_y,
+                size=(
+                    sym_buffer.num_topk,
+                    sym_buffer.num_max_tokens_per_rank,
+                    sym_buffer.hidden,
+                ),
+                stride=(
+                    sym_buffer.num_max_tokens_per_rank * sym_buffer.hidden,
+                    sym_buffer.hidden,
+                    1,
+                ),
+            )
+            _timed_cuda_phase(
+                "grad_y_expose_copy",
+                lambda: backward_grad_y[0, :num_tokens].copy_(grad_y.to(torch.bfloat16).contiguous()),
+            )
+        else:
+            _timed_cuda_phase(
+                "grad_y_expose_copy",
+                lambda: backward_grad_y[:num_tokens].copy_(grad_y.to(torch.bfloat16).contiguous()),
+            )
+        dispatch_inputs_prepared = memory_mode == "phase_ordered"
+        if dispatch_inputs_prepared and not pipeline_dy:
+            # The prelude starts with a device-side NVLink barrier. It publishes
+            # local grad-y before pulling grad-y, x, and route weights with the
+            # full persistent grid. POST_DOWN also performs its exact route dot
+            # and weighted-grad write; PRE_DOWN needs only the input dispatch.
+            prepare_route_and_weighted = route_weight_mode is RouteWeightMode.POST_DOWN
 
-        def launch_prelude(
-            *,
-            do_reverse_dispatch: bool,
-            compute_route_dot: bool,
-            write_weighted: bool,
-            synchronize_ranks: bool,
-            synchronize_after_dispatch: bool,
-            barrier_only: bool = False,
-        ) -> None:
-            route_prelude_threads = 256
-            if (
-                compute_route_dot
-                and grad_y.shape[1] == 2048
-                and combine_order_mode is not CombineOrderMode.FIXED_TOPK
-            ):
-                try:
-                    route_prelude_threads = int(_BF16_ROUTE_PRELUDE_THREADS)
-                except ValueError as exc:
-                    raise ValueError(
-                        "DG_BF16_ROUTE_PRELUDE_THREADS must be 128 or 256, got "
-                        f"{_BF16_ROUTE_PRELUDE_THREADS!r}"
-                    ) from exc
-                if route_prelude_threads not in (128, 256):
-                    raise ValueError(
-                        "DG_BF16_ROUTE_PRELUDE_THREADS must be 128 or 256, got "
-                        f"{route_prelude_threads}"
-                    )
-            _C.bf16_mega_moe_backward_post_down_prelude_v2(
-                grad_y_unweighted_output,
-                grad_ye,
-                x_pool_output,
-                route_weights,
-                grad_route_output,
-                down_unweighted_output,
-                expert_counts,
-                sym_buffer.backward_grad_y,
-                sym_buffer.x,
-                sym_buffer.topk_weights,
-                sym_buffer.backward_grad_route,
-                sym_buffer.token_src_metadata,
-                sym_buffer.handle.buffer_ptrs,
-                sym_buffer.group.rank(),
-                sym_buffer.num_topk,
-                block_m,
-                combine_order_mode.value,
-                do_reverse_dispatch,
-                compute_route_dot,
-                write_weighted,
-                synchronize_ranks,
-                synchronize_after_dispatch,
-                barrier_only,
-                x_prepared,
-                route_prelude_threads,
-            )
+            def launch_prelude(
+                *,
+                do_reverse_dispatch: bool,
+                compute_route_dot: bool,
+                write_weighted: bool,
+                synchronize_ranks: bool,
+                synchronize_after_dispatch: bool,
+                barrier_only: bool = False,
+            ) -> None:
+                threads = 256
+                if (
+                    compute_route_dot
+                    and grad_y.shape[1] == 2048
+                    and combine_order_mode is not CombineOrderMode.FIXED_TOPK
+                ):
+                    threads = route_prelude_threads
+                _C.bf16_mega_moe_backward_post_down_prelude_v2(
+                    grad_y_unweighted_output,
+                    grad_ye,
+                    x_pool_output,
+                    route_weights,
+                    grad_route_output,
+                    down_unweighted_output,
+                    expert_counts,
+                    sym_buffer.backward_grad_y,
+                    sym_buffer.x,
+                    sym_buffer.topk_weights,
+                    sym_buffer.backward_grad_route,
+                    sym_buffer.token_src_metadata,
+                    sym_buffer.handle.buffer_ptrs,
+                    sym_buffer.group.rank(),
+                    sym_buffer.num_topk,
+                    block_m,
+                    combine_order_mode.value,
+                    do_reverse_dispatch,
+                    compute_route_dot,
+                    write_weighted,
+                    synchronize_ranks,
+                    synchronize_after_dispatch,
+                    barrier_only,
+                    x_prepared,
+                    threads,
+                    **_scoped_num_sms_kwargs(sym_buffer),
+                )
 
-        def launch_decomposed_route_prelude() -> None:
-            _timed_cuda_phase(
-                "rank_arrival_barrier",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=False,
-                    compute_route_dot=False,
-                    write_weighted=False,
-                    synchronize_ranks=True,
-                    synchronize_after_dispatch=False,
-                    barrier_only=True,
-                ),
-            )
-            _timed_cuda_phase(
-                "reverse_dispatch_nvlink_pull",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=True,
-                    compute_route_dot=False,
-                    write_weighted=False,
-                    synchronize_ranks=False,
-                    synchronize_after_dispatch=False,
-                ),
-            )
-            _timed_cuda_phase(
-                "final_rank_synchronization",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=False,
-                    compute_route_dot=False,
-                    write_weighted=False,
-                    synchronize_ranks=False,
-                    synchronize_after_dispatch=True,
-                    barrier_only=True,
-                ),
-            )
-            _timed_cuda_phase(
-                "exact_route_dot_reduction",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=False,
-                    compute_route_dot=True,
-                    write_weighted=False,
-                    synchronize_ranks=False,
-                    synchronize_after_dispatch=False,
-                ),
-            )
-            _timed_cuda_phase(
-                "route_weight_multiply_write",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=False,
-                    compute_route_dot=False,
-                    write_weighted=True,
-                    synchronize_ranks=False,
-                    synchronize_after_dispatch=False,
-                ),
-            )
+            def launch_decomposed_route_prelude() -> None:
+                _timed_cuda_phase(
+                    "rank_arrival_barrier",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=False,
+                        compute_route_dot=False,
+                        write_weighted=False,
+                        synchronize_ranks=True,
+                        synchronize_after_dispatch=False,
+                        barrier_only=True,
+                    ),
+                )
+                _timed_cuda_phase(
+                    "reverse_dispatch_nvlink_pull",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=True,
+                        compute_route_dot=False,
+                        write_weighted=False,
+                        synchronize_ranks=False,
+                        synchronize_after_dispatch=False,
+                    ),
+                )
+                _timed_cuda_phase(
+                    "final_rank_synchronization",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=False,
+                        compute_route_dot=False,
+                        write_weighted=False,
+                        synchronize_ranks=False,
+                        synchronize_after_dispatch=True,
+                        barrier_only=True,
+                    ),
+                )
+                _timed_cuda_phase(
+                    "exact_route_dot_reduction",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=False,
+                        compute_route_dot=True,
+                        write_weighted=False,
+                        synchronize_ranks=False,
+                        synchronize_after_dispatch=False,
+                    ),
+                )
+                _timed_cuda_phase(
+                    "route_weight_multiply_write",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=False,
+                        compute_route_dot=False,
+                        write_weighted=True,
+                        synchronize_ranks=False,
+                        synchronize_after_dispatch=False,
+                    ),
+                )
 
-        def launch_decomposed_input_prelude() -> None:
-            _timed_cuda_phase(
-                "rank_arrival_barrier",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=False,
-                    compute_route_dot=False,
-                    write_weighted=False,
-                    synchronize_ranks=True,
-                    synchronize_after_dispatch=False,
-                    barrier_only=True,
-                ),
-            )
-            _timed_cuda_phase(
-                "reverse_dispatch_nvlink_pull",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=True,
-                    compute_route_dot=False,
-                    write_weighted=False,
-                    synchronize_ranks=False,
-                    synchronize_after_dispatch=False,
-                ),
-            )
-            _timed_cuda_phase(
-                "final_rank_synchronization",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=False,
-                    compute_route_dot=False,
-                    write_weighted=False,
-                    synchronize_ranks=False,
-                    synchronize_after_dispatch=True,
-                    barrier_only=True,
-                ),
-            )
+            def launch_decomposed_input_prelude() -> None:
+                _timed_cuda_phase(
+                    "rank_arrival_barrier",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=False,
+                        compute_route_dot=False,
+                        write_weighted=False,
+                        synchronize_ranks=True,
+                        synchronize_after_dispatch=False,
+                        barrier_only=True,
+                    ),
+                )
+                _timed_cuda_phase(
+                    "reverse_dispatch_nvlink_pull",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=True,
+                        compute_route_dot=False,
+                        write_weighted=False,
+                        synchronize_ranks=False,
+                        synchronize_after_dispatch=False,
+                    ),
+                )
+                _timed_cuda_phase(
+                    "final_rank_synchronization",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=False,
+                        compute_route_dot=False,
+                        write_weighted=False,
+                        synchronize_ranks=False,
+                        synchronize_after_dispatch=True,
+                        barrier_only=True,
+                    ),
+                )
 
-        def launch_chunked_route_prelude() -> None:
-            # Pull the two remote BF16 planes with the dispatch-only vector
-            # path, then preserve the exact Triton route reduction tree while
-            # consuming the local grad-y plane. Splitting here avoids coupling
-            # NVLink load coalescing to Triton's strided reduction lane map.
-            _timed_cuda_phase(
-                "reverse_dispatch_nvlink_pull",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=True,
-                    compute_route_dot=False,
-                    write_weighted=False,
-                    synchronize_ranks=True,
-                    synchronize_after_dispatch=True,
-                ),
-            )
-            _timed_cuda_phase(
-                "exact_route_dot_weighted_write",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=False,
-                    compute_route_dot=True,
-                    write_weighted=True,
-                    synchronize_ranks=False,
-                    # Route gradients are written directly into each source
-                    # rank's symmetric top-k plane. W2 combine's entry
-                    # barrier publishes these earlier same-stream writes
-                    # before W13 combine and the source-plane clone.
-                    synchronize_after_dispatch=False,
-                ),
-            )
+            def launch_chunked_route_prelude() -> None:
+                # Pull the two remote BF16 planes with the dispatch-only vector
+                # path, then preserve the exact Triton route reduction tree while
+                # consuming the local grad-y plane. Splitting here avoids coupling
+                # NVLink load coalescing to Triton's strided reduction lane map.
+                _timed_cuda_phase(
+                    "reverse_dispatch_nvlink_pull",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=True,
+                        compute_route_dot=False,
+                        write_weighted=False,
+                        synchronize_ranks=True,
+                        synchronize_after_dispatch=True,
+                    ),
+                )
+                _timed_cuda_phase(
+                    "exact_route_dot_weighted_write",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=False,
+                        compute_route_dot=True,
+                        write_weighted=True,
+                        synchronize_ranks=False,
+                        # Route gradients are written directly into each source
+                        # rank's symmetric top-k plane. W2 combine's entry
+                        # barrier publishes these earlier same-stream writes
+                        # before W13 combine and the source-plane clone.
+                        synchronize_after_dispatch=False,
+                    ),
+                )
 
-        def launch_split_barrier_fused_route_prelude() -> None:
-            _timed_cuda_phase(
-                "rank_arrival_barrier",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=False,
-                    compute_route_dot=False,
-                    write_weighted=False,
-                    synchronize_ranks=True,
-                    synchronize_after_dispatch=False,
-                    barrier_only=True,
-                ),
-            )
-            _timed_cuda_phase(
-                "fused_reverse_dispatch_route",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=True,
-                    compute_route_dot=True,
-                    write_weighted=True,
-                    synchronize_ranks=False,
-                    synchronize_after_dispatch=False,
-                ),
-            )
-            _timed_cuda_phase(
-                "final_rank_synchronization",
-                lambda: launch_prelude(
-                    do_reverse_dispatch=False,
-                    compute_route_dot=False,
-                    write_weighted=False,
-                    synchronize_ranks=False,
-                    synchronize_after_dispatch=True,
-                    barrier_only=True,
-                ),
-            )
+            def launch_split_barrier_fused_route_prelude() -> None:
+                _timed_cuda_phase(
+                    "rank_arrival_barrier",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=False,
+                        compute_route_dot=False,
+                        write_weighted=False,
+                        synchronize_ranks=True,
+                        synchronize_after_dispatch=False,
+                        barrier_only=True,
+                    ),
+                )
+                _timed_cuda_phase(
+                    "fused_reverse_dispatch_route",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=True,
+                        compute_route_dot=True,
+                        write_weighted=True,
+                        synchronize_ranks=False,
+                        synchronize_after_dispatch=False,
+                    ),
+                )
+                _timed_cuda_phase(
+                    "final_rank_synchronization",
+                    lambda: launch_prelude(
+                        do_reverse_dispatch=False,
+                        compute_route_dot=False,
+                        write_weighted=False,
+                        synchronize_ranks=False,
+                        synchronize_after_dispatch=True,
+                        barrier_only=True,
+                    ),
+                )
 
-        _timed_cuda_phase(
-            ("reverse_dispatch_route_prelude" if prepare_route_and_weighted else "reverse_dispatch_input_prelude"),
-            (
-                launch_decomposed_route_prelude
-                if prepare_route_and_weighted and _BF16_BACKWARD_DECOMPOSE_PRELUDE
-                else (
-                    launch_split_barrier_fused_route_prelude
-                    if (prepare_route_and_weighted and _BF16_BACKWARD_SPLIT_BARRIER_FUSED_ROUTE)
+            _timed_cuda_phase(
+                ("reverse_dispatch_route_prelude" if prepare_route_and_weighted else "reverse_dispatch_input_prelude"),
+                (
+                    launch_decomposed_route_prelude
+                    if prepare_route_and_weighted and _BF16_BACKWARD_DECOMPOSE_PRELUDE
                     else (
-                        launch_chunked_route_prelude
-                        if prepare_route_and_weighted
+                        launch_split_barrier_fused_route_prelude
+                        if (prepare_route_and_weighted and split_barrier_fused_route)
                         else (
-                            launch_decomposed_input_prelude
-                            if _BF16_BACKWARD_DECOMPOSE_PRELUDE
-                            else lambda: launch_prelude(
-                                do_reverse_dispatch=True,
-                                compute_route_dot=False,
-                                write_weighted=False,
-                                synchronize_ranks=True,
-                                synchronize_after_dispatch=True,
+                            launch_chunked_route_prelude
+                            if prepare_route_and_weighted
+                            else (
+                                launch_decomposed_input_prelude
+                                if _BF16_BACKWARD_DECOMPOSE_PRELUDE
+                                else lambda: launch_prelude(
+                                    do_reverse_dispatch=True,
+                                    compute_route_dot=False,
+                                    write_weighted=False,
+                                    synchronize_ranks=True,
+                                    synchronize_after_dispatch=True,
+                                )
                             )
                         )
                     )
-                )
-            ),
-        )
+                ),
+            )
     kernel_trace_hook = _BF16_BACKWARD_KERNEL_TRACE_HOOK
     kernel_trace = None
     trace_clock_rate_khz = 0.0
@@ -603,6 +638,7 @@ def bf16_mega_moe_backward_dgrad(
         kernel_trace, trace_clock_rate_khz = (
             _allocate_backward_kernel_trace(
                 _BF16_BACKWARD_KERNEL_TRACE_SITES, grad_y.device,
+                getattr(sym_buffer, "num_sms", None),
             )
         )
     _timed_cuda_phase(
@@ -644,6 +680,12 @@ def bf16_mega_moe_backward_dgrad(
             combine_order_mode.value,
             memory_mode,
             kernel_trace,
+            vectorized_grad_x_store=vectorized_grad_x_store,
+            wide_grad_x_store=wide_grad_x_store,
+            pipeline_dy=pipeline_dy,
+            backward_phase=backward_phase,
+            **situ_kwargs,
+            **_scoped_num_sms_kwargs(sym_buffer),
         ),
     )
     if kernel_trace_hook is not None:
@@ -1432,6 +1474,7 @@ def mega_moe_backward_combine_grad_x(
             else sym_buffer.topk_idx
         ),
         combine_order_mode.value,
+        **_scoped_num_sms_kwargs(sym_buffer),
     )
 
 
