@@ -2,6 +2,8 @@
 
 Usage: python tests/compile_mega_moe_compat.py --output-dir /tmp/mega-moe-compile
 Requires nvcc and the CUTLASS submodule. This checks compilation, not GPU results.
+Use --variants partial-grid, backward-math, or k31-route for the optional
+Kimi compatibility matrices; the default matrix and CI cost stay unchanged.
 """
 
 import argparse
@@ -65,8 +67,21 @@ def cases():
                 if kind == "bf16":
                     args += ["CombineOrderMode::DeepEPV1" if training else "CombineOrderMode::FixedTopK"]
                 args += [training, training]
+                if kind == "bf16":
+                    args += [False]  # Preserve the optional FP32-output template argument.
                 header = f"sm100_{kind}_mega_moe"
                 yield f"{kind}_m{block_m}_s{shared}_t{int(training)}", header, header + "_impl", args
+                if kind == "bf16" and shared == 0:
+                    yield (f"separate_fwd_m{block_m}_t{int(training)}", header, header + "_impl",
+                           args + ["4.0f", "__builtin_inff()", True])
+                if kind == "bf16" and training:
+                    for linear_beta in ("__builtin_inff()", "8.0f", "25.0f"):
+                        situ_args = args.copy()
+                        situ_args[situ_args.index("ActivationType::GeGLU")] = "ActivationType::SiTU"
+                        situ_args += ["4.0f", linear_beta]
+                        suffix = "unbounded" if linear_beta == "__builtin_inff()" else f"linear{linear_beta[:-3]}"
+                        yield f"situ_fwd_m{block_m}_{suffix}", header, header + "_impl", situ_args
+                        yield f"situ_fwd_separate_m{block_m}_{suffix}", header, header + "_impl", situ_args + [True]
                 if kind == "fp8_fp4" and not training:
                     fp8_args = args.copy()
                     fp8_args[fp8_args.index("cutlass::detail::float_e2m1_unpacksmem_t")] = "cutlass::float_e4m3_t"
@@ -81,6 +96,23 @@ def cases():
                     False, False, True, True, True, True]
             yield (f"backward_b{int(bf16)}_m{block_m}", "sm100_fp8_fp4_mega_moe_backward",
                    "sm100_fp8_fp4_mega_moe_backward_wave_impl", args)
+
+            if bf16:
+                for activation in ("GeGLU", "SwiGLU"):
+                    separate_args = args.copy()
+                    separate_args[separate_args.index("ActivationType::GeGLU")] = f"ActivationType::{activation}"
+                    separate_args += [False, False, False, "4.0f", "__builtin_inff()", True]
+                    yield (f"separate_bwd_m{block_m}_{activation}", "sm100_fp8_fp4_mega_moe_backward",
+                           "sm100_fp8_fp4_mega_moe_backward_wave_impl", separate_args)
+                for linear_beta in ("__builtin_inff()", "8.0f"):
+                    situ_args = args.copy()
+                    situ_args[situ_args.index("ActivationType::GeGLU")] = "ActivationType::SiTU"
+                    situ_args += [False, False, False, "4.0f", linear_beta]
+                    suffix = "linear" if linear_beta == "8.0f" else "unbounded"
+                    yield (f"situ_bwd_m{block_m}_{suffix}", "sm100_fp8_fp4_mega_moe_backward",
+                           "sm100_fp8_fp4_mega_moe_backward_wave_impl", situ_args)
+                    yield (f"situ_bwd_separate_m{block_m}_{suffix}", "sm100_fp8_fp4_mega_moe_backward",
+                           "sm100_fp8_fp4_mega_moe_backward_wave_impl", situ_args + [True])
 
     for combine in (False, True):
         args = ["cute::UMMA::Major::MN", "cute::UMMA::Major::MN", 512, 256, 0,
@@ -106,15 +138,51 @@ def cases():
            "sm100_mega_moe_backward_combine_grad_x", [2, 4, "CombineOrderMode::DeepEPV1"])
 
 
+
+def selected_cases(variant):
+    """Keep optional compile matrices in one harness without monkeypatching it."""
+    if variant == "k31-route":
+        for order in ("DeepEPV1", "FixedTopK"):
+            for route_dot in (False, True):
+                for dispatch in (False, True):
+                    for prepared in (False, True):
+                        args = [3584, 8, 32, 140, 2, f"CombineOrderMode::{order}",
+                                dispatch, route_dot, True, False, False, False, False,
+                                prepared, 256]
+                        yield (f"k31_route_{order}_{int(route_dot)}{int(dispatch)}{int(prepared)}",
+                               "sm100_fp8_fp4_mega_moe_backward",
+                               "sm100_bf16_mega_moe_backward_post_down_prelude", args)
+        return
+    for name, header, function, args in cases():
+        if variant == "compat":
+            yield name, header, function, args
+        elif variant == "partial-grid" and header == "sm100_bf16_mega_moe":
+            # Fill optional SiTU/separate-L1 arguments before locality domains.
+            defaults = ["4.0f", "__builtin_inff()", False]
+            assert 28 <= len(args) <= 31, (name, args)
+            yield f"partial_grid_{name}", header, function, args + defaults[len(args) - 28:] + [False]
+        elif variant == "backward-math" and function == "sm100_fp8_fp4_mega_moe_backward_wave_impl":
+            assert args[14] is False, (name, args)
+            for fast_math in (False, True):
+                parameters = args.copy()
+                parameters[14] = fast_math
+                yield f"{name}_fast{int(fast_math)}", header, function, parameters
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nvcc", default="nvcc")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--case-prefix", default="")
+    parser.add_argument("--variants", choices=("compat", "partial-grid", "backward-math", "k31-route"),
+                        default="compat")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parents[1]
     count = 0
-    for name, header, function, template_args in cases():
+    architecture = "sm_103f" if args.variants == "k31-route" else "sm_100a"
+    for name, header, function, template_args in selected_cases(args.variants):
+        if not name.startswith(args.case_prefix):
+            continue
         source = args.output_dir / f"{name}.cu"
         parameters = ", ".join(str(value).lower() if isinstance(value, bool) else str(value)
                                for value in template_args)
@@ -122,7 +190,7 @@ def main():
             f"#include <deep_gemm/impls/{header}.cuh>\nusing namespace deep_gemm;\n"
             f"void instantiate() {{ auto p = reinterpret_cast<void*>(&{function}<{parameters}>); }}\n"
         )
-        command = [args.nvcc, "-std=c++20", "--expt-relaxed-constexpr", "-arch=sm_100a",
+        command = [args.nvcc, "-std=c++20", "--expt-relaxed-constexpr", f"-arch={architecture}",
                    "--cubin", "-O3", "-I", str(root / "deep_gemm/include"),
                    "-I", str(root / "third-party/cutlass/include"), str(source),
                    "-o", str(source.with_suffix(".cubin"))]

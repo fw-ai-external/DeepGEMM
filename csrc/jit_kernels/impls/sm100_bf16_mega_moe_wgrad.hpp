@@ -43,7 +43,7 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
     DG_HOST_ASSERT(
         a.scalar_type() == torch::kBFloat16 and
         b.scalar_type() == torch::kBFloat16 and
-        d.scalar_type() == torch::kBFloat16);
+        (d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat));
     DG_HOST_ASSERT(d.is_contiguous());
     DG_HOST_ASSERT(
         allow_row_strided_inputs
@@ -75,10 +75,11 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         "DG_BF16_MEGA_MOE_WGRAD_NUM_STAGES", 4);
     const int kSwizzle =
         kBlockK * static_cast<int>(sizeof(cutlass::bfloat16_t));
+    const int output_element_size = static_cast<int>(d.element_size());
     const int kStoreBlockN = deep_jit::get_env<int>(
-        "DG_BF16_MEGA_MOE_WGRAD_STORE_BLOCK_N", 64);
+        "DG_BF16_MEGA_MOE_WGRAD_STORE_BLOCK_N", 128 / output_element_size);
     // The output store width is independent of the A/B K tile.
-    const int kSwizzleCD = kStoreBlockN * sizeof(cutlass::bfloat16_t);
+    const int kSwizzleCD = kStoreBlockN * output_element_size;
     DG_HOST_ASSERT(kSwizzleCD == 32 or kSwizzleCD == 64 or kSwizzleCD == 128);
     constexpr int kNumNonEpilogueThreads = 128;
     constexpr int kNumEpilogueThreads = 128;
@@ -89,7 +90,7 @@ static void sm100_bf16_mega_moe_wgrad_1sm(
         kNumNonEpilogueThreads + kNumEpilogueThreads +
         num_extra_combine_threads;
     const int kSmemSize =
-        2 * kBlockM * kStoreBlockN * sizeof(cutlass::bfloat16_t) +
+        2 * kBlockM * kStoreBlockN * output_element_size +
         kNumStages * (kBlockM + kBlockN) * kBlockK *
             sizeof(cutlass::bfloat16_t) +
         1024;

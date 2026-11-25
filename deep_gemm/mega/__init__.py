@@ -1,3 +1,4 @@
+import math
 import torch
 import types
 import warnings
@@ -29,6 +30,41 @@ class CombineOrderMode(str, Enum):
     DEEPEP_V1 = 'deepep_v1'
 
 
+def _situ_kwargs(activation, beta, linear_beta, route_weight_mode, clamp, fast_math,
+                 *, allow_fast_math=False):
+    if activation != 'situ':
+        return {}
+    if not math.isfinite(beta) or beta <= 0:
+        raise ValueError('situ_beta must be positive and finite')
+    linear_beta = float('inf') if linear_beta is None else linear_beta
+    if math.isnan(linear_beta) or linear_beta <= 0:
+        raise ValueError('situ_linear_beta must be positive or None')
+    if RouteWeightMode(route_weight_mode) is not RouteWeightMode.POST_DOWN:
+        raise ValueError('SiTU requires post_down route weights')
+    if clamp is not None and clamp != float('inf'):
+        raise ValueError('SiTU requires an unclamped activation')
+    if fast_math and not allow_fast_math:
+        raise ValueError('SiTU requires fast_math=False')
+    return dict(situ_beta=beta, situ_linear_beta=linear_beta)
+
+
+def _validate_num_sms(num_sms):
+    if num_sms is None:
+        return None
+    if type(num_sms) is not int or num_sms <= 0 or num_sms % 2:
+        raise ValueError("num_sms must be a positive even integer or None")
+    if not getattr(_C, "BF16_MEGAMOE_SCOPED_SM_BUDGET", False):
+        raise RuntimeError("Explicit BF16 MegaMoE num_sms requires a matching build")
+    if num_sms > torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count:
+        raise ValueError("num_sms exceeds the current device's SM count")
+    return num_sms
+
+
+def _scoped_num_sms_kwargs(sym_buffer):
+    num_sms = getattr(sym_buffer, "num_sms", None)
+    return {} if num_sms is None else {"num_sms": num_sms}
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
@@ -39,9 +75,21 @@ class SymmBuffer:
                  activation: str = 'swiglu',
                  base: Optional['SymmBuffer'] = None,
                  num_shared_experts: int = 0,
-                 side_lora: bool = False):
+                 side_lora: bool = False,
+                 bounded_lag: bool = False,
+                 num_sms: Optional[int] = None):
+        if num_sms is not None and (side_lora or mma_type != "bf16xbf16"):
+            raise ValueError("Explicit num_sms requires merged-weight BF16")
+        self._num_sms = _validate_num_sms(num_sms)
+        if base is not None and getattr(base, "num_sms", None) != self._num_sms:
+            raise ValueError("A reused symmetric buffer must have the same SM budget")
         # Align token count
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+
+        if bounded_lag and (mma_type != 'bf16xbf16' or side_lora):
+            raise ValueError("bounded lag requires the BF16 MegaMoE path")
+        if bounded_lag and not hasattr(_C, "get_symm_buffer_size_for_bf16_mega_moe_bounded_lag"):
+            raise RuntimeError("bounded lag requires a matching DeepGEMM build")
 
         if num_ring_tokens is not None and (
             num_ring_tokens <= 0 or num_ring_tokens % _C.get_token_alignment_for_mega_moe() != 0
@@ -59,6 +107,7 @@ class SymmBuffer:
         self.num_shared_experts = num_shared_experts
         self.mma_type = mma_type
         self.activation = activation
+        self.bounded_lag = bounded_lag
 
         # Allocate or reuse a symmetric buffer
         if side_lora:
@@ -69,10 +118,13 @@ class SymmBuffer:
                 hidden, intermediate_hidden, mma_type, activation, num_ring_tokens or 0,
             )
         else:
-            num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe_v3(
+            size_buffer = (_C.get_symm_buffer_size_for_bf16_mega_moe_bounded_lag if bounded_lag
+                           else _C.get_symm_buffer_size_for_mega_moe_v3)
+            num_bytes, slice_input_buffers = size_buffer(
                 group.size(), num_experts, num_max_tokens_per_rank, num_topk,
                 hidden, intermediate_hidden, mma_type, activation,
                 num_ring_tokens or 0, num_shared_experts,
+                **_scoped_num_sms_kwargs(self),
             )
         if base is None:
             allocator = torch if group.size() == 1 else symm_mem
@@ -122,6 +174,11 @@ class SymmBuffer:
         self.num_ring_tokens = self.l1_acts.size(0)
         self.num_sf_ring_tokens = self.l1_acts_sf.size(0) if self.l1_acts_sf is not None else 0
 
+    @property
+    def num_sms(self):
+        """Rank-uniform launch budget fixed when this buffer is created."""
+        return self._num_sms
+
     def destroy(self):
         self.handle = None
         self.buffer = None
@@ -145,6 +202,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_ring_tokens: Optional[int] = None,
                                  num_shared_experts: int = 0,
                                  side_lora: bool = False,
+                                 bounded_lag: bool = False,
+                                 num_sms: Optional[int] = None,
                                  ) -> SymmBuffer:
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
@@ -160,7 +219,7 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         hidden, intermediate_hidden,
         num_ring_tokens,
         mma_type=mma_type, activation=activation, num_shared_experts=num_shared_experts,
-        side_lora=side_lora,
+        side_lora=side_lora, bounded_lag=bounded_lag, num_sms=num_sms,
     )
 
 
@@ -451,7 +510,10 @@ def bf16_mega_moe(y: torch.Tensor,
                   num_config_tokens: Optional[int] = None,
                   saved_x: Optional[torch.Tensor] = None,
                   shared_l1_weights: Optional[torch.Tensor] = None,
-                  shared_l2_weights: Optional[torch.Tensor] = None):
+                  shared_l2_weights: Optional[torch.Tensor] = None,
+                  situ_beta: float = 4.0,
+                  situ_linear_beta: Optional[float] = None,
+                  l1_up_weights: Optional[torch.Tensor] = None):
     """Run BF16 MegaMoE with an explicit route-weight boundary.
 
     ``y`` is BF16 by default. An explicitly supplied FP32 output is supported
@@ -468,7 +530,28 @@ def bf16_mega_moe(y: torch.Tensor,
     pools from actual receive counts. The kernel publishes the precomputed
     counts, verifies them against its internal dispatch count, and sets the
     flag before any caller can accept a truncated result.
+
+    ``l1_up_weights`` selects separate contiguous gate/up tensors instead of
+    an eight-row-interleaved ``l1_weights`` tensor. Fused shared experts are
+    not supported with this layout. MMA and activation rounding are unchanged.
+
+    A buffer constructed with ``bounded_lag=True`` selects the bounded L1/L2
+    task stream. Its ring and schedule are derived from fixed buffer capacity,
+    independent of the current rank's token count.
     """
+    situ_kwargs = _situ_kwargs(activation, situ_beta, situ_linear_beta,
+                               route_weight_mode, activation_clamp, fast_math)
+    weight_kwargs = {}
+    if getattr(sym_buffer, "bounded_lag", False):
+        weight_kwargs["bounded_lag"] = True
+    if l1_up_weights is not None:
+        if not getattr(_C, "BF16_MEGAMOE_SEPARATE_L1", False):
+            raise RuntimeError("separate forward weights require a matching DeepGEMM build")
+        if shared_l1_weights is not None:
+            raise ValueError("separate forward weights require shared experts outside MegaMoE")
+        weight_kwargs["l1_up_weights"] = l1_up_weights
+    if activation == "situ" and shared_l1_weights is not None:
+        raise ValueError("SiTU shared experts must run outside MegaMoE")
     route_weight_mode = RouteWeightMode(route_weight_mode)
     combine_order_mode = CombineOrderMode(combine_order_mode)
     if (
@@ -531,6 +614,9 @@ def bf16_mega_moe(y: torch.Tensor,
         route_count_mismatch,
         saved_x,
         shared_l1_weights, shared_l2_weights,
+        **situ_kwargs,
+        **weight_kwargs,
+        **_scoped_num_sms_kwargs(sym_buffer),
     )
 
 def bf16_mega_moe_side_lora(y: torch.Tensor,

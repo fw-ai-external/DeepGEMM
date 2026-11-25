@@ -34,7 +34,11 @@ def runtime():
              "bf16_mega_moe_backward_dgrad"}
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     assert len(functions) == len(names)
-    namespace = dict(torch=torch, math=math, Optional=Optional, Any=Any,
+    # Include the production helpers added by the SiTU/scoped-SM wrapper.
+    api = ast.parse((source.parent / "__init__.py").read_text())
+    helpers = {"_situ_kwargs", "_scoped_num_sms_kwargs"}
+    functions += [node for node in api.body if isinstance(node, ast.FunctionDef) and node.name in helpers]
+    namespace = dict(torch=torch, math=math, Optional=Optional, Any=Any, _C=SimpleNamespace(),
                      RouteWeightMode=RouteWeightMode, CombineOrderMode=CombineOrderMode,
                      _BF16_BACKWARD_KERNEL_TRACE_HOOK=None,
                      _BF16_BACKWARD_DECOMPOSE_PRELUDE=False,
@@ -78,7 +82,7 @@ def test_prepared_reuse_keeps_rank_barriers_and_route_clear(prepared):
         # must still execute after the route-plane clear and before Kernel A.
         assert values[17:] == (not prepared, False, False, True, True, prepared, True, 256)
 
-    def kernel(*values):
+    def kernel(*values, **options):
         assert len(calls) == 1
         assert values[8] is args["grad_ye"]
         assert values[10] is args["route_weights"]

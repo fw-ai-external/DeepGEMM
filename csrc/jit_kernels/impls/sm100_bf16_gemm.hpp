@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <format>
 #include <torch/python.h>
 
@@ -119,6 +120,21 @@ static void __instantiate_kernel() {{
     }
 };
 
+// A capacity-selected layout must remain valid when runtime M/N change.
+// Multicast along a dynamic dimension requires divisibility of its tile count,
+// which is not guaranteed by capacity planning. Keep multicast along static
+// dimensions available, without padding or allocating to the tuning shape.
+struct SM100DynamicBF16GemmArchSpec : SM100ArchSpec {
+    static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
+        auto candidates = SM100ArchSpec::get_layout_candidates(desc);
+        std::erase_if(candidates, [&](const Layout& layout) {
+            return (desc.compiled_dims.find('m') == std::string::npos && layout.cluster_m > 1) ||
+                   (desc.compiled_dims.find('n') == std::string::npos && layout.cluster_n > 1);
+        });
+        return candidates;
+    }
+};
+
 static void sm100_bf16_gemm(const torch::Tensor& a,
                             const torch::Tensor& b,
                             const std::optional<torch::Tensor>& c,
@@ -126,7 +142,8 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
                             const int& m, const int& n, const int& k,
                             const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                             const std::string& compiled_dims,
-                            const std::shared_ptr<EpilogueClass>& epilogue_class) {
+                            const std::shared_ptr<EpilogueClass>& epilogue_class,
+                            const std::optional<std::array<int, 3>>& tuning_shape = std::nullopt) {
     const auto desc = GemmDesc {
         .gemm_type = GemmType::Normal,
         .kernel_type = KernelType::KernelNoSF,
@@ -139,7 +156,21 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
         .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims
     };
-    const auto config = get_best_config<SM100ArchSpec>(desc);
+    const auto config = [&]() {
+        if (!tuning_shape.has_value())
+            return get_best_config<SM100ArchSpec>(desc);
+        auto tuning_desc = desc;
+        const std::array<int, 3> actual_shape{m, n, k};
+        for (int i = 0; i < 3; ++i) {
+            DG_HOST_ASSERT((*tuning_shape)[i] > 0);
+            DG_HOST_ASSERT(compiled_dims.find("mnk"[i]) == std::string::npos ||
+                           (*tuning_shape)[i] == actual_shape[i]);
+        }
+        tuning_desc.m = (*tuning_shape)[0];
+        tuning_desc.n = (*tuning_shape)[1];
+        tuning_desc.k = (*tuning_shape)[2];
+        return get_best_config<SM100DynamicBF16GemmArchSpec>(tuning_desc);
+    }();
 
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,

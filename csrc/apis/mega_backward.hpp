@@ -152,7 +152,14 @@ static void bf16_mega_moe_backward_dgrad_v2(
     const std::string& combine_order_mode,
     const std::string& memory_mode,
     const std::optional<torch::Tensor>& kernel_trace =
-        std::nullopt) {
+        std::nullopt,
+    const float situ_beta = 4.0f,
+    const float situ_linear_beta = std::numeric_limits<float>::infinity(),
+    const std::optional<torch::Tensor>& w3_weights = std::nullopt,
+    const bool vectorized_grad_x_store = true,
+    const bool wide_grad_x_store = false,
+    const bool pipeline_dy = false, const int backward_phase = 0,
+    const std::optional<int>& num_sms_opt = std::nullopt) {
     deep_gemm::sm100_bf16_mega_moe_backward_dgrad(
         gate_up_output, grad_h_output, grad_gate_up_output,
         h_act_output, h_weighted_output, x_pool_output,
@@ -169,7 +176,8 @@ static void bf16_mega_moe_backward_dgrad_v2(
         token_src_metadata,
         backward_sym_buffer_ptrs, backward_rank,
         num_max_tokens_per_rank, num_topk, memory_mode,
-        kernel_trace);
+        kernel_trace, situ_beta, situ_linear_beta, w3_weights,
+        vectorized_grad_x_store, wide_grad_x_store, pipeline_dy, backward_phase, num_sms_opt);
 }
 
 static void bf16_mega_moe_backward_dgrad(
@@ -250,7 +258,9 @@ static void bf16_mega_moe_backward_post_down_prelude_v2(
     const bool& synchronize_after_dispatch,
     const bool& barrier_only,
     const bool& x_prepared,
-    const int& route_prelude_threads) {
+    const int& route_prelude_threads,
+    const bool& skip_unweighted_padding = false,
+    const std::optional<int>& num_sms_opt = std::nullopt) {
     deep_gemm::
         sm100_bf16_mega_moe_backward_post_down_prelude(
             grad_y_unweighted_output,
@@ -266,7 +276,7 @@ static void bf16_mega_moe_backward_post_down_prelude_v2(
             write_weighted, synchronize_ranks,
             synchronize_after_dispatch,
             barrier_only, x_prepared,
-            route_prelude_threads);
+            route_prelude_threads, skip_unweighted_padding, std::nullopt, num_sms_opt);
 }
 
 static void bf16_mega_moe_backward_post_down_prelude(
@@ -315,11 +325,12 @@ static void mega_moe_backward_combine_grad_x(
     const int& num_ranks,
     const int& num_local_experts,
     const std::optional<torch::Tensor>& topk_ids,
-    const std::string& combine_order_mode) {
+    const std::string& combine_order_mode,
+    const std::optional<int>& num_sms_opt = std::nullopt) {
     deep_gemm::sm100_mega_moe_backward_combine_grad_x(
         grad_x_output, combine_buffer, topk_ids,
         num_max_tokens_per_rank, num_topk, num_ranks,
-        num_local_experts, combine_order_mode);
+        num_local_experts, combine_order_mode, num_sms_opt);
 }
 
 static void bf16_mega_moe_backward_w2(
@@ -607,7 +618,15 @@ static void register_apis(pybind11::module_& m) {
         py::arg("num_topk"),
         py::arg("combine_order_mode") = "fixed_topk",
         py::arg("memory_mode") = "legacy",
-        py::arg("kernel_trace") = py::none());
+        py::arg("kernel_trace") = py::none(),
+        py::arg("situ_beta") = 4.0f,
+        py::arg("situ_linear_beta") = std::numeric_limits<float>::infinity(),
+        py::arg("w3_weights") = py::none(),
+        py::arg("vectorized_grad_x_store") = true,
+        py::arg("wide_grad_x_store") = false,
+        py::arg("pipeline_dy") = false,
+        py::arg("backward_phase") = 0,
+        py::arg("num_sms") = py::none());
     m.def(
         "bf16_mega_moe_backward_dgrad",
         &bf16_mega_moe_backward_dgrad,
@@ -673,7 +692,9 @@ static void register_apis(pybind11::module_& m) {
         py::arg("synchronize_after_dispatch") = true,
         py::arg("barrier_only") = false,
         py::arg("x_prepared") = false,
-        py::arg("route_prelude_threads") = 256);
+        py::arg("route_prelude_threads") = 256,
+        py::arg("skip_unweighted_padding") = false,
+        py::arg("num_sms") = py::none());
     m.def(
         "bf16_mega_moe_backward_post_down_prelude",
         &bf16_mega_moe_backward_post_down_prelude,
@@ -711,7 +732,8 @@ static void register_apis(pybind11::module_& m) {
         py::arg("num_ranks"),
         py::arg("num_local_experts"),
         py::arg("topk_ids") = py::none(),
-        py::arg("combine_order_mode") = "fixed_topk");
+        py::arg("combine_order_mode") = "fixed_topk",
+        py::arg("num_sms") = py::none());
     m.def("bf16_mega_moe_backward_w2",
           &bf16_mega_moe_backward_w2,
           py::arg("grad_w2_output"), py::arg("grad_ye"),

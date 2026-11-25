@@ -159,9 +159,15 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // Dispatch region
     const int smem_expert_count_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
+    const int smem_pull_buffers_size = static_cast<int>(
+        layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes());
+    // The BF16 training dispatch reuses this region for per-warp expert
+    // counters before any pull begins. Counter capacity is independent of
+    // the transfer chunk size (900 counters need more than 3584 bytes).
+    const int smem_stable_counter_size = mma_kind == MmaKind::BF16
+        ? num_dispatch_warps * num_experts * static_cast<int>(sizeof(uint32_t)) : 0;
     const int smem_send_buffers_size = align(
-        static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
-        kSmemAlignment);
+        std::max(smem_pull_buffers_size, smem_stable_counter_size), kSmemAlignment);
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
     // C/D output region: max of L1 output staging and L2 BF16 staging.
