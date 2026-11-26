@@ -386,7 +386,8 @@ static void fp8_fp4_mega_moe(
     const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l1_weights_tuple_opt,
     const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l2_weights_tuple_opt,
     const std::optional<float>& situ_beta_opt,
-    const std::optional<float>& situ_linear_beta_opt
+    const std::optional<float>& situ_linear_beta_opt,
+    const bool& local_claim
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -552,7 +553,8 @@ static void fp8_fp4_mega_moe(
                                route_weight_mode,
                                saved_down_unweighted,
                                saved_l1_acts,
-                               saved_l1_acts_sf);
+                               saved_l1_acts_sf,
+                               local_claim);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -1169,7 +1171,8 @@ static void register_apis(pybind11::module_& m) {
         py::arg("shared_l1_weights_tuple_opt") = py::none(),
         py::arg("shared_l2_weights_tuple_opt") = py::none(),
         py::arg("situ_beta_opt") = py::none(),
-        py::arg("situ_linear_beta_opt") = py::none());
+        py::arg("situ_linear_beta_opt") = py::none(),
+        py::arg("local_claim") = false);
     m.def("bf16_mega_moe", &bf16_mega_moe,
         py::arg("y"),
         py::arg("l1_weights"),

@@ -44,6 +44,7 @@ template <
     bool kSaveL1Acts = false,
     float kSituBeta = 1.0f,
     float kSituLinearBeta = cute::numeric_limits<float>::infinity(),
+    bool kLocalClaim = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -314,7 +315,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumExpertsPerRank,
         kNumSMs, kNumRanks,
         kNumRingBlocks, kNumLocalityDomains,
-        kNumSharedExperts>(
+        kNumSharedExperts, math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
+        L1_SHAPE_N / BLOCK_N, L2_SHAPE_N / BLOCK_N,
+        L1_SHAPE_N / (BLOCK_N * 2), L2_SHAPE_N / (BLOCK_N * 2), 0, kLocalClaim>(
             workspace,
             shared_storage.task_info_full_barriers,
             shared_storage.task_info_empty_barriers,
@@ -383,6 +386,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         };
 
+        if constexpr (not kLocalClaim) {
         // Count experts' tokens
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
@@ -444,6 +448,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
             /* After the NVLink barrier, there is a grid sync */ true
         );
+        }  // not kLocalClaim
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -464,7 +469,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         scheduler.fetch_expert_recv_count();
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
-        for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+        const auto claim_pull_token = [&]() -> uint32_t {
+            uint32_t v = 0;
+            if (cute::elect_one_sync())
+                v = ptx::atomic_add(workspace.get_grid_sync_count_ptr<0>(), 1u);
+            return ptx::exchange(v, 0);
+        };
+        for (uint32_t token_idx = (kLocalClaim ? claim_pull_token() : sm_idx * kNumDispatchWarps + warp_idx); ;
+             token_idx = (kLocalClaim ? claim_pull_token() : token_idx + kNumGlobalWarps)) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
@@ -662,6 +674,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
+        if constexpr (not kLocalClaim) {
         DG_STATIC_ASSERT(kNumSMs > 1, "Invalid SM count");
         if (sm_idx == 0) {
             // SM 0: clear expert send count and schedule task counters
@@ -727,6 +740,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
         );
+        }  // not kLocalClaim
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -1577,6 +1591,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if constexpr (kLocalClaim) {
+                    if (epilogue_warp_idx == 0 and not task_info.is_shared() and cute::elect_one_sync()) {
+                        __threadfence();
+                        ptx::red_add_rel(workspace.get_grid_sync_count_ptr<1>(), 1u);
+                    }
+                    __syncwarp();
+                }
             }
         }
 
@@ -1631,14 +1652,29 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
             peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
 
+        if constexpr (kLocalClaim) {
+            // Local mode: wait for every routed L2 half-task (one arrival per CTA per task) to publish.
+            if (epilogue_warp_idx == 0) {
+                scheduler.fetch_expert_recv_count();
+                const uint32_t num_expected = scheduler.num_total_m_blocks * (L2_SHAPE_N / BLOCK_N);
+                if (cute::elect_one_sync()) {
+                    const auto done_ptr = workspace.get_grid_sync_count_ptr<1>();
+                    comm::wait_until([&]() { return ptx::ld_acq(done_ptr) >= num_expected; },
+                                     [&]() { printf("DeepGEMM local L2 completion timeout: sm=%u\n", sm_idx); });
+                }
+                __syncwarp();
+            }
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+        } else {
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
             workspace, sm_idx, epilogue_thread_idx,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
+        }
 
         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
-        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
+        if (not kLocalClaim and sm_idx == 0 and epilogue_thread_idx < kNumRanks)
             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
 
         // Barrier with dispatch warps, so that they can do clean workspace
@@ -1646,7 +1682,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         const auto grid_idx = ptx::get_grid_idx() + 1;
-        for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
+        const auto claim_combine_chunk = [&]() -> uint32_t {
+            uint32_t v = 0;
+            if (cute::elect_one_sync())
+                v = ptx::atomic_add(workspace.get_grid_sync_count_ptr<2>(), 1u);
+            return ptx::exchange(v, 0);
+        };
+        for (uint32_t token_chunk_idx = (kLocalClaim ? claim_combine_chunk() : epilogue_warp_idx * kNumSMs + sm_idx);
+             token_chunk_idx < num_tokens * kNumChunks;
+             token_chunk_idx = (kLocalClaim ? claim_combine_chunk() : token_chunk_idx + kNumSMs * kNumEpilogueWarps)) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
 
@@ -1660,6 +1704,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const bool is_routed = lane_idx < kNumTopk and stored_topk_slot_idx >= 0;
             const auto peer_ready_ptr = workspace.get_combine_ready_grid_idx_ptr(
                 is_routed ? static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank : 0);
+            if constexpr (not kLocalClaim)
             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
 

@@ -62,9 +62,11 @@ static void sm100_fp8_fp4_mega_moe(
     const std::string& route_weight_mode,
     const std::optional<torch::Tensor>& saved_down_unweighted,
     const std::optional<torch::Tensor>& saved_l1_acts,
-    const std::optional<torch::Tensor>& saved_l1_acts_sf
+    const std::optional<torch::Tensor>& saved_l1_acts_sf,
+    const bool& local_claim = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    DG_HOST_ASSERT(not local_claim or (num_ranks == 1 and num_shared_experts == 0));
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
@@ -273,7 +275,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
-        {}, {}, {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -294,7 +296,7 @@ static void __instantiate_kernel() {{
         to_string(l1_weights.scalar_type()),
         get_activation_type_name(activation), saved_l1_preact.has_value(),
         get_fp8_fp4_route_weight_mode_name(route_weight_mode), saved_down_unweighted.has_value(), saved_l1_acts.has_value(),
-        to_string(situ_beta), to_string(situ_linear_beta)));
+        to_string(situ_beta), to_string(situ_linear_beta), local_claim ? "true" : "false"));
 
     // Launch
     jit->launch(
