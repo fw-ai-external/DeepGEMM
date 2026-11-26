@@ -350,13 +350,21 @@ def fp8_fp4_mega_moe(
     *,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    local_claim: bool = False,
 ):
     """Run MXFP8/FP4 MegaMoE with an explicit route-weight boundary.
 
     POST_DOWN quantizes the unweighted gated activation for W2 and optionally
     saves each route's exact BF16 unweighted W2 output before applying its
     score at the remote combine write.
+
+    local_claim (one-rank buffers only) launches the kernel without grid-wide
+    barriers: work is claimed in dependency order, so it completes with any
+    number of free SMs. The caller must run deep_gemm.mega.local.LocalPlan.plan
+    on the launch stream before each launch.
     """
+    if local_claim and sym_buffer.group.size() != 1:
+        raise ValueError("local_claim requires a one-rank symmetric buffer")
     route_weight_mode = RouteWeightMode(route_weight_mode)
     has_explicit_config_tokens = num_config_tokens is not None
     if num_config_tokens is None:
@@ -404,6 +412,7 @@ def fp8_fp4_mega_moe(
         num_config_tokens,
         shared_l1_weights, shared_l2_weights,
         **situ_kwargs,
+        local_claim=local_claim,
     )
 
 

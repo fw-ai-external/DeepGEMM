@@ -178,8 +178,13 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
           uint32_t kNumL1Clusters = kNumL1BlockNs / 2,
           uint32_t kNumL2Clusters = kNumL2BlockNs / 2,
-          uint32_t kL2LagUnits = 0>
+          uint32_t kL2LagUnits = 0,
+          bool kLocalClaim = false>
 struct MegaMoEScheduler {
+    // Local claim: one-rank launches whose counts and route table come from
+    // deep_gemm.mega.local.LocalPlan; no grid-wide barrier in the kernel.
+    DG_STATIC_ASSERT(not kLocalClaim or (kNumRanks == 1 and kNumSharedExperts == 0 and kL2LagUnits == 0),
+                     "Local claim requires one rank, no in-kernel shared experts and no bounded lag");
     static constexpr bool kHasShared = kNumSharedExperts > 0;
     static constexpr uint32_t SHARED_L1_SHAPE_N = L1_SHAPE_N * kNumSharedExperts;
     static constexpr uint32_t SHARED_L1_SHAPE_K = L1_SHAPE_K;
@@ -295,7 +300,7 @@ struct MegaMoEScheduler {
             if (expert_idx < kNumExpertsPerRank) {
                 do {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                } while (not kLocalClaim and static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
@@ -386,6 +391,31 @@ struct MegaMoEScheduler {
                               is_l2 ? L2_SHAPE_N : L1_SHAPE_N, is_l2 ? L2_SHAPE_K : L1_SHAPE_K);
         }
         uint32_t m_block_idx, n_cluster_idx;
+        if constexpr (kLocalClaim) {
+            // Local mode: one global claim sequence on the domain-0 counter. Warmup L1 blocks, then per M block
+            // [L2 tasks of m][L1 tasks of m + W]. Every L2 depends only on earlier-claimed L1,
+            // so progress does not require any number of co-resident CTAs.
+            constexpr uint32_t n1 = kNumL1Clusters, n2 = kNumL2Clusters;
+            constexpr uint32_t kWarmupBlocks = math::constexpr_ceil_div(2u * (kNumSMs / 2), n1 + n2) + 1;
+            const uint32_t num_blocks = num_total_m_blocks;
+            const uint32_t w = cute::min(kWarmupBlocks, num_blocks);
+            const uint32_t i = get_next_local_task_idx(workspace.get_l1_task_count_ptr(), 0);
+            if (i < w * n1)
+                return create_task(BlockPhase::Linear1, i / n1, i % n1, L1_SHAPE_N, L1_SHAPE_K);
+            uint32_t j = i - w * n1;
+            const uint32_t num_periods = num_blocks - w;
+            if (j < num_periods * (n1 + n2)) {
+                const uint32_t m = j / (n1 + n2), r = j % (n1 + n2);
+                if (r < n2)
+                    return create_task(BlockPhase::Linear2, m, r, L2_SHAPE_N, L2_SHAPE_K);
+                return create_task(BlockPhase::Linear1, m + w, r - n2, L1_SHAPE_N, L1_SHAPE_K);
+            }
+            j -= num_periods * (n1 + n2);
+            const uint32_t m = num_periods + j / n2;
+            if (m < num_blocks)
+                return create_task(BlockPhase::Linear2, m, j % n2, L2_SHAPE_N, L2_SHAPE_K);
+            return task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0);
+        }
         while (true) {
             if (num_sched_l1_waves != kNumSchedL1WavesDone and num_sched_l1_waves) {
                 // One local L1 task per scheduler; globally this is one CTA-pair wave.
