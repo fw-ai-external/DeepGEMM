@@ -52,7 +52,7 @@ struct TokenSrcMetadata {
 };
 
 struct alignas(128) MegaMoESignals {
-    static constexpr uint32_t kNumMaxGridSyncCounters = 4;
+    static constexpr uint32_t kNumMaxGridSyncCounters = 10;
     static constexpr uint32_t kNumMaxExperts = 2048;
     static constexpr uint32_t kNumMaxExpertsPerRank = 512;
 

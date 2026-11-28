@@ -179,12 +179,16 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumL1Clusters = kNumL1BlockNs / 2,
           uint32_t kNumL2Clusters = kNumL2BlockNs / 2,
           uint32_t kL2LagUnits = 0,
-          bool kLocalClaim = false>
+          bool kLocalClaim = false,
+          bool kCommClaim = false>
 struct MegaMoEScheduler {
     // Local claim: one-rank launches whose counts and route table come from
     // deep_gemm.mega.local.LocalPlan; no grid-wide barrier in the kernel.
     DG_STATIC_ASSERT(not kLocalClaim or (kNumRanks == 1 and kNumSharedExperts == 0 and kL2LagUnits == 0),
                      "Local claim requires one rank, no in-kernel shared experts and no bounded lag");
+    // Comm claim: multi-rank launches use the same claim order; dispatch publishes each rank's counts once.
+    DG_STATIC_ASSERT(not kCommClaim or (kNumSharedExperts == 0 and kL2LagUnits == 0 and not kLocalClaim),
+                     "Comm claim requires no in-kernel shared experts and no bounded lag");
     static constexpr bool kHasShared = kNumSharedExperts > 0;
     static constexpr uint32_t SHARED_L1_SHAPE_N = L1_SHAPE_N * kNumSharedExperts;
     static constexpr uint32_t SHARED_L1_SHAPE_K = L1_SHAPE_K;
@@ -298,9 +302,22 @@ struct MegaMoEScheduler {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
+                if constexpr (kCommClaim) {
+                    // Each rank adds (1 << 32) | count once, after its source indices and per-rank counts
+                    const auto sum_ptr = workspace.get_expert_recv_count_sum_ptr(expert_idx);
+                    const auto start_clock = clock64();
+                    while (static_cast<uint32_t>((value = ptx::ld_acq_sys(sum_ptr)) >> 32) != kNumRanks) {
+                        if (clock64() - start_clock >= 60ll * 2000000000ll) {
+                            printf("DeepGEMM claim dispatch counts timeout: expert=%u, value=%llu\n", expert_idx,
+                                   static_cast<unsigned long long>(value));
+                            DG_DEVICE_ASSERT(false and "Timeout");
+                        }
+                    }
+                } else {
                 do {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
                 } while (not kLocalClaim and static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                }
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
@@ -391,8 +408,8 @@ struct MegaMoEScheduler {
                               is_l2 ? L2_SHAPE_N : L1_SHAPE_N, is_l2 ? L2_SHAPE_K : L1_SHAPE_K);
         }
         uint32_t m_block_idx, n_cluster_idx;
-        if constexpr (kLocalClaim) {
-            // Local mode: one global claim sequence on the domain-0 counter. Warmup L1 blocks, then per M block
+        if constexpr (kLocalClaim or kCommClaim) {
+            // Claim modes: one global claim sequence on the domain-0 counter. Warmup L1 blocks, then per M block
             // [L2 tasks of m][L1 tasks of m + W]. Every L2 depends only on earlier-claimed L1,
             // so progress does not require any number of co-resident CTAs.
             constexpr uint32_t n1 = kNumL1Clusters, n2 = kNumL2Clusters;
