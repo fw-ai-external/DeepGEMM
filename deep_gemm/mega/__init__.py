@@ -351,6 +351,7 @@ def fp8_fp4_mega_moe(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     local_claim: bool = False,
+    comm_claim: bool = False,
 ):
     """Run MXFP8/FP4 MegaMoE with an explicit route-weight boundary.
 
@@ -362,9 +363,17 @@ def fp8_fp4_mega_moe(
     barriers: work is claimed in dependency order, so it completes with any
     number of free SMs. The caller must run deep_gemm.mega.local.LocalPlan.plan
     on the launch stream before each launch.
+
+    comm_claim (no in-kernel shared experts) launches a multi-rank kernel without
+    grid-wide barriers: dispatch, pull, GEMM and combine work is claimed in
+    dependency order and only the last CTA of each rank meets the other ranks.
+    It completes while other kernels hold any number of SMs, as long as one SM
+    is free on every rank. Every rank of the group must use the same mode.
     """
     if local_claim and sym_buffer.group.size() != 1:
         raise ValueError("local_claim requires a one-rank symmetric buffer")
+    if comm_claim and (local_claim or shared_l1_weights is not None):
+        raise ValueError("comm_claim excludes local_claim and in-kernel shared experts")
     route_weight_mode = RouteWeightMode(route_weight_mode)
     has_explicit_config_tokens = num_config_tokens is not None
     if num_config_tokens is None:
@@ -413,6 +422,7 @@ def fp8_fp4_mega_moe(
         shared_l1_weights, shared_l2_weights,
         **situ_kwargs,
         local_claim=local_claim,
+        comm_claim=comm_claim,
     )
 
 
