@@ -594,7 +594,8 @@ static void bf16_mega_moe(
     const float situ_beta, const float situ_linear_beta,
     const std::optional<torch::Tensor>& l1_up_weights,
     const bool bounded_lag,
-    const std::optional<int>& num_sms_opt = std::nullopt) {
+    const std::optional<int>& num_sms_opt = std::nullopt,
+    const bool local_claim = false) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
     DG_HOST_ASSERT(activation == "swiglu" or activation == "geglu" or activation == "situ");
@@ -747,7 +748,7 @@ static void bf16_mega_moe(
                             precomputed_route_counts,
                             active_pool_rows,
                             route_count_mismatch,
-                            saved_x, situ_beta, situ_linear_beta, l1_up_weights, bounded_lag, num_sms_opt);
+                            saved_x, situ_beta, situ_linear_beta, l1_up_weights, bounded_lag, num_sms_opt, local_claim);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -1205,7 +1206,8 @@ static void register_apis(pybind11::module_& m) {
         py::arg("situ_linear_beta") = std::numeric_limits<float>::infinity(),
         py::arg("l1_up_weights") = py::none(),
         py::arg("bounded_lag") = false,
-        py::arg("num_sms") = py::none());
+        py::arg("num_sms") = py::none(),
+        py::arg("local_claim") = false);
 }
 
 } // namespace deep_gemm::mega

@@ -75,8 +75,10 @@ static void sm100_bf16_mega_moe(
     const float situ_beta, const float situ_linear_beta,
     const std::optional<torch::Tensor>& l1_up_weights,
     const bool bounded_lag,
-    const std::optional<int>& num_sms_opt = std::nullopt) {
+    const std::optional<int>& num_sms_opt = std::nullopt,
+    const bool local_claim = false) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    DG_HOST_ASSERT(not local_claim or (num_ranks == 1 and num_shared_experts == 0 and not bounded_lag));
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
@@ -227,7 +229,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
-        {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -249,7 +251,8 @@ static void __instantiate_kernel() {{
         y.scalar_type() == torch::kFloat32,
         to_string(situ_beta), to_string(situ_linear_beta), l1_up_weights.has_value(),
         num_sms == jit->device.get_num_sms(),
-        bounded_lag ? sched::get_bounded_lag_units(num_max_tokens_per_rank, num_topk, num_experts_per_rank) : 0));
+        bounded_lag ? sched::get_bounded_lag_units(num_max_tokens_per_rank, num_topk, num_experts_per_rank) : 0,
+        local_claim ? "true" : "false"));
 
     // Launch
     jit->launch(

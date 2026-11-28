@@ -522,7 +522,8 @@ def bf16_mega_moe(y: torch.Tensor,
                   shared_l2_weights: Optional[torch.Tensor] = None,
                   situ_beta: float = 4.0,
                   situ_linear_beta: Optional[float] = None,
-                  l1_up_weights: Optional[torch.Tensor] = None):
+                  l1_up_weights: Optional[torch.Tensor] = None,
+                  local_claim: bool = False):
     """Run BF16 MegaMoE with an explicit route-weight boundary.
 
     ``y`` is BF16 by default. An explicitly supplied FP32 output is supported
@@ -547,7 +548,13 @@ def bf16_mega_moe(y: torch.Tensor,
     A buffer constructed with ``bounded_lag=True`` selects the bounded L1/L2
     task stream. Its ring and schedule are derived from fixed buffer capacity,
     independent of the current rank's token count.
+
+    local_claim (one-rank buffers only) launches without grid-wide barriers,
+    like fp8_fp4_mega_moe. Run deep_gemm.mega.local.LocalPlan.plan on the
+    launch stream first. The in-kernel route-count check is skipped.
     """
+    if local_claim and sym_buffer.group.size() != 1:
+        raise ValueError("local_claim requires a one-rank symmetric buffer")
     situ_kwargs = _situ_kwargs(activation, situ_beta, situ_linear_beta,
                                route_weight_mode, activation_clamp, fast_math)
     weight_kwargs = {}
@@ -626,6 +633,7 @@ def bf16_mega_moe(y: torch.Tensor,
         **situ_kwargs,
         **weight_kwargs,
         **_scoped_num_sms_kwargs(sym_buffer),
+        local_claim=local_claim,
     )
 
 def bf16_mega_moe_side_lora(y: torch.Tensor,
